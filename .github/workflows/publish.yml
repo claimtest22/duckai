@@ -28,7 +28,7 @@ jobs:
             echo "::error::No PyPI token found. Add a repository secret named 'pypi' (or 'PYPI_API_TOKEN') with your PyPI API token."
             exit 1
           fi
-          echo "PyPI token is present"
+          echo "PyPI token is present (len=${#PYPI_TOKEN})"
 
       - name: Install build tools
         run: |
@@ -43,4 +43,5 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.pypi || secrets.PYPI_API_TOKEN }}
         run: |
-          twine upload --skip-existing dist/*
+          twine check dist/*
+          twine upload --verbose --skip-existing dist/*
