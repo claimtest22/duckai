@@ -40,6 +40,8 @@ class Client:
         Optional proxy URL.
     model: str | Model
         Default model.
+    system: str | None
+        Optional system prompt applied to every request.
     max_retries: int
         How many times to refresh challenge / rotate on failure.
     log_level: str
@@ -49,6 +51,7 @@ class Client:
     __slots__ = (
         "_http",
         "_model",
+        "_system",
         "_vqd4",
         "_hash1",
         "_max_retries",
@@ -63,6 +66,7 @@ class Client:
         impersonate: Optional[str] = None,
         proxy: Optional[str] = None,
         model: Union[str, Model] = Model.GPT_4O_MINI,
+        system: Optional[str] = None,
         max_retries: int = 6,
         log_level: str = "INFO",
         pool: Optional[Sequence[str]] = None,
@@ -74,6 +78,7 @@ class Client:
             pool=pool or IMPERSONATE_POOL,
         )
         self._model = str(model)
+        self._system = system
         self._vqd4: Optional[str] = None
         self._hash1: Optional[str] = None
         self._max_retries = max_retries
@@ -90,11 +95,37 @@ class Client:
         self._model = str(value)
 
     @property
+    def system(self) -> Optional[str]:
+        """Current system prompt (if any)."""
+        return self._system
+
+    @system.setter
+    def system(self, value: Optional[str]) -> None:
+        self._system = value
+
+    @property
     def history(self) -> List[Dict[str, str]]:
         return list(self._history)
 
     def clear_history(self) -> None:
         self._history.clear()
+
+    def _build_messages(
+        self,
+        content: str,
+        *,
+        history: bool,
+        system: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Build the messages list, optionally injecting a system prompt."""
+        messages: List[Dict[str, str]] = []
+        sys_prompt = system if system is not None else self._system
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        if history:
+            messages.extend(self._history)
+        messages.append({"role": "user", "content": content})
+        return messages
 
     async def _refresh_tokens(self, force: bool = False) -> None:
         """Fetch status and solve challenge."""
@@ -181,6 +212,7 @@ class Client:
         content: str,
         *,
         model: Optional[Union[str, Model]] = None,
+        system: Optional[str] = None,
         history: bool = True,
     ) -> ChatResult:
         """Send a message and return the full response.
@@ -191,14 +223,15 @@ class Client:
             User message.
         model: str | Model | None
             Override default model.
+        system: str | None
+            Optional system prompt override for this call.
         history: bool
             Whether to keep conversation history.
         """
         await self._ensure_ready()
         model_s = str(model or self._model)
 
-        messages = list(self._history) if history else []
-        messages.append({"role": "user", "content": content})
+        messages = self._build_messages(content, history=history, system=system)
 
         body = {
             "model": model_s,
@@ -250,14 +283,26 @@ class Client:
         content: str,
         *,
         model: Optional[Union[str, Model]] = None,
+        system: Optional[str] = None,
         history: bool = True,
     ) -> AsyncIterator[StreamChunk]:
-        """Stream a response as SSE chunks."""
+        """Stream a response as SSE chunks.
+
+        Parameters
+        ----------
+        content: str
+            User message.
+        model: str | Model | None
+            Override default model.
+        system: str | None
+            Optional system prompt override for this call.
+        history: bool
+            Whether to keep conversation history.
+        """
         await self._ensure_ready()
         model_s = str(model or self._model)
 
-        messages = list(self._history) if history else []
-        messages.append({"role": "user", "content": content})
+        messages = self._build_messages(content, history=history, system=system)
 
         body = {
             "model": model_s,
