@@ -1,4 +1,4 @@
-# duckai
+# duckchat
 
 High-performance reverse-engineered **Duck.ai** (DuckDuckGo AI Chat) client.
 
@@ -19,7 +19,7 @@ Made by **frat**.
 ## Install
 
 ```bash
-pip install duckai
+pip install duckchat
 # or from source
 pip install -e .
 ```
