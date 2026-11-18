@@ -1,14 +1,19 @@
 """
 Static VQD hash challenge solver.
 
-Pure-Python reimplementation of the Duck.ai x-vqd-hash-1 challenge.
+Pure-Python best-effort reimplementation of the Duck.ai x-vqd-hash-1 challenge.
+When the live challenge requires real DOM metrics the static path can fail with
+418 ERR_CHALLENGE; callers may inject a browser-captured solved hash instead.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
+import tempfile
 from base64 import b64decode, b64encode
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import orjson
@@ -17,55 +22,58 @@ from .logging import log
 
 
 def _sha256_b64(data: str) -> str:
-    digest = hashlib.sha256(data.encode("utf-8")).digest()
-    return b64encode(digest).decode("ascii")
+    return b64encode(hashlib.sha256(data.encode("utf-8")).digest()).decode("ascii")
 
 
-def _parse_server_hashes(js_text: str) -> List[str]:
-    """Extract server_hashes array from challenge JS."""
-    try:
-        part = js_text.split('server_hashes: ["', maxsplit=1)[1]
-        part = part.split('"]', maxsplit=1)[0]
-        return [h for h in part.split('","') if h]
-    except (IndexError, ValueError):
-        pass
-
+def _parse_server_hashes(script: str) -> List[str]:
+    """Pull server_hashes from the challenge return payload / string table."""
     found: List[str] = []
-    for m in re.finditer(r"[A-Za-z0-9+/]{40,60}={0,2}", js_text):
-        h = m.group(0)
-        if len(h) >= 40 and h not in found:
+
+    ret = script[script.rfind("return{"):] if "return{" in script else script
+    for h in re.findall(r"'([A-Za-z0-9+/]{40,60}={0,2})'", ret):
+        if h not in found:
             found.append(h)
-        if len(found) >= 3:
-            break
-    return found[:3] if found else []
 
-
-def _parse_dom_fingerprint(js_text: str) -> str:
-    """Reconstruct the DOM fingerprint string the challenge hashes.
-
-    The challenge does roughly:
-        const e = document.createElement('div');
-        e.innerHTML = '<div><div></div><div></div';
-        return String(BASE + e.innerHTML.length);
-    """
-    # Common hardcoded bases observed in live challenges
-    for base in (101, 3393, 3426, 0x11A0, 6823, 6824, 123):
-        # innerHTML length of '<div><div></div><div></div' is ~27-28 depending on trailing
-        for length in (27, 28, 23, 24, 31):
-            candidate = str(base + length)
-            if candidate in js_text or str(base) in js_text:
-                return candidate
-
-    # Try to pull numeric literals near createElement / innerHTML
-    nums = re.findall(r"(?:String\()?(\d{2,5})\s*\+", js_text)
-    if nums:
+    if len(found) < 2:
         try:
-            base = int(nums[0])
-            return str(base + 27)
-        except ValueError:
+            part = script.split('server_hashes: ["', maxsplit=1)[1]
+            part = part.split('"]', maxsplit=1)[0]
+            for h in part.split('","'):
+                if h and h not in found:
+                    found.append(h)
+        except (IndexError, ValueError):
             pass
 
-    return "128"  # safe fallback seen in some static solvers
+    if len(found) < 2:
+        for m in re.finditer(r"[A-Za-z0-9+/]{40,60}={0,2}", script):
+            h = m.group(0)
+            if len(h) >= 40 and h not in found:
+                found.append(h)
+            if len(found) >= 3:
+                break
+
+    return found[:3]
+
+
+def _parse_dom_fingerprint(script: str) -> str:
+    """Best-effort DOM fingerprint string."""
+    htmlish = re.findall(r"'(<(?:br|div)[^']*>)'", script)
+    tmpl = htmlish[0] if htmlish else "<div><div></div><div></div>"
+    for base in (101, 0, 128, 3393, 3426, 0x11A0):
+        if str(base) in script:
+            return str(base + len(tmpl))
+    return str(101 + len(tmpl))
+
+
+def _parse_meta(script: str) -> Dict[str, str]:
+    meta: Dict[str, str] = {"v": "4"}
+    m = re.search(r"'challenge_id':'([^']+)'", script)
+    if m:
+        meta["challenge_id"] = m.group(1)
+    m = re.search(r"'timestamp':'([^']+)'", script)
+    if m:
+        meta["timestamp"] = m.group(1)
+    return meta
 
 
 def solve_static(
@@ -75,24 +83,7 @@ def solve_static(
     sec_ch_ua: str = "",
     origin: str = "https://duckduckgo.com",
 ) -> str:
-    """Solve the x-vqd-hash-1 challenge purely in Python.
-
-    Parameters
-    ----------
-    challenge_b64: str
-        The raw base64 value from the status response header.
-    user_agent: str
-        The User-Agent that will be used for the subsequent chat request.
-    sec_ch_ua: str
-        Optional sec-ch-ua header value (brands string).
-    origin: str
-        Origin embedded in meta (unused by newest challenges but kept).
-
-    Returns
-    -------
-    str
-        Base64-encoded solved payload ready for the x-vqd-hash-1 header.
-    """
+    """Solve the x-vqd-hash-1 challenge with a pure-Python approximation."""
     try:
         script = b64decode(challenge_b64).decode("utf-8", errors="replace")
     except Exception:
@@ -100,8 +91,8 @@ def solve_static(
 
     server_hashes = _parse_server_hashes(script)
     dom_fp = _parse_dom_fingerprint(script)
-
     ua_fp = user_agent + (sec_ch_ua or "")
+
     client_hashes = [
         _sha256_b64(ua_fp),
         _sha256_b64(dom_fp),
@@ -112,16 +103,81 @@ def solve_static(
         "client_hashes": client_hashes,
         "signals": {},
     }
+    meta = _parse_meta(script)
+    if meta:
+        meta.setdefault("origin", origin)
+        payload["meta"] = meta
 
     solved = b64encode(orjson.dumps(payload)).decode("ascii")
     log.debug(
-        "challenge solved  servers={}  clients={}  dom={}  len={}",
+        "static solve  servers={}  dom={}  len={}",
         len(server_hashes),
-        len(client_hashes),
         dom_fp,
         len(solved),
     )
     return solved
+
+
+def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
+    """Execute the challenge in Node.js when available."""
+    try:
+        script = b64decode(challenge_b64).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    wrapper = f"""
+global.navigator = {{
+  userAgent: {user_agent!r},
+  webdriver: false,
+  userAgentData: {{ brands: [] }},
+}};
+global.document = {{
+  createElement: () => ({{
+    style: {{}},
+    innerHTML: '',
+    textContent: '',
+    offsetHeight: 1,
+    offsetWidth: 1,
+    getBoundingClientRect: () => ({{ width: 1, height: 1, top: 0, left: 0 }}),
+    appendChild: () => {{}},
+    removeChild: () => {{}},
+  }}),
+  body: {{ appendChild: () => {{}}, removeChild: () => {{}} }},
+  documentElement: {{}},
+}};
+global.window = global;
+global.self = global;
+global.Promise = Promise;
+(async () => {{
+  const result = await ({script});
+  if (result && result.client_hashes) {{
+    const crypto = require('crypto');
+    result.client_hashes = result.client_hashes.map((v) => {{
+      if (typeof v === 'string' && v.length > 20 && v.endsWith('=')) return v;
+      return crypto.createHash('sha256').update(String(v)).digest('base64');
+    }});
+  }}
+  process.stdout.write(Buffer.from(JSON.stringify(result)).toString('base64'));
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+    try:
+        proc = subprocess.run(
+            ["node", "-e", wrapper],
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            out = proc.stdout.decode("ascii", errors="ignore").strip()
+            if out:
+                log.debug("node solve ok len={}", len(out))
+                return out
+        log.debug("node solve failed: {}", proc.stderr[:200] if proc.stderr else "")
+    except FileNotFoundError:
+        log.debug("node not available")
+    except Exception as e:
+        log.debug("node solve error: {}", e)
+    return None
 
 
 def solve_from_status(
@@ -130,6 +186,7 @@ def solve_from_status(
     *,
     sec_ch_ua: str = "",
     origin: str = "https://duckduckgo.com",
+    prefer_node: bool = True,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Extract challenge + vqd-4 from status headers and solve.
 
@@ -145,10 +202,14 @@ def solve_from_status(
     if not challenge:
         return None, vqd4
 
-    solved = solve_static(
-        challenge,
-        user_agent,
-        sec_ch_ua=sec_ch_ua,
-        origin=origin,
-    )
+    solved: Optional[str] = None
+    if prefer_node:
+        solved = solve_with_node(challenge, user_agent)
+    if not solved:
+        solved = solve_static(
+            challenge,
+            user_agent,
+            sec_ch_ua=sec_ch_ua,
+            origin=origin,
+        )
     return solved, vqd4
