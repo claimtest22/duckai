@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -29,6 +30,23 @@ def _sha256_b64(data: str) -> str:
     return b64encode(hashlib.sha256(str(data).encode("utf-8")).digest()).decode(
         "ascii"
     )
+
+
+def _node_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    try:
+        root = subprocess.check_output(
+            ["npm", "root", "-g"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if root:
+            existing = env.get("NODE_PATH", "")
+            env["NODE_PATH"] = root if not existing else f"{root}{os.pathsep}{existing}"
+    except Exception:
+        pass
+    return env
 
 
 def _parse_server_hashes(script: str) -> List[str]:
@@ -90,6 +108,7 @@ def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
                 capture_output=True,
                 timeout=12,
                 check=False,
+                env=_node_env(),
             )
         finally:
             try:
@@ -98,7 +117,7 @@ def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
                 pass
 
         if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:300]
+            err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:400]
             log.debug("node solver rc={} err={}", proc.returncode, err)
             return None
 
@@ -155,7 +174,6 @@ def solve_static(
     meta = _parse_meta(script)
     meta["origin"] = origin
 
-    # Verified shape: [UA, score_a, score_b] then SHA-256 each
     client_hashes = [
         _sha256_b64(user_agent),
         _sha256_b64("2733"),
