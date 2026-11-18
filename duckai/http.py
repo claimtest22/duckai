@@ -1,5 +1,5 @@
 """
-Low-level HTTP session with curl_cffi impersonation rotation.
+Low-level HTTP session with curl_cffi impersonation.
 """
 
 from __future__ import annotations
@@ -15,38 +15,77 @@ from .logging import log
 from .errors import HTTPException, RateLimitError, AuthError
 
 
+# Prefer Android Chrome profiles — matches real phone traffic
 IMPERSONATE_POOL: List[str] = [
-    "chrome131",
-    "chrome124",
-    "chrome120",
-    "chrome119",
-    "chrome116",
-    "chrome110",
-    "chrome99",
     "chrome131_android",
     "chrome99_android",
-    "safari17_0",
-    "safari15_5",
+    "chrome124",
+    "chrome120",
+    "chrome116",
+    "chrome110",
 ]
+
+# Canonical UA strings that curl_cffi emits for each profile.
+# MUST stay in sync with what the wire request sends or PoW fails.
+UA_FOR_IMPERSONATE: Dict[str, str] = {
+    "chrome131_android": (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Mobile Safari/537.36"
+    ),
+    "chrome99_android": (
+        "Mozilla/5.0 (Linux; Android 12; Pixel 5) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/99.0.4844.88 Mobile Safari/537.36"
+    ),
+    "chrome131": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "chrome124": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "chrome120": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "chrome116": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0.0.0 Safari/537.36"
+    ),
+    "chrome110": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/110.0.0.0 Safari/537.36"
+    ),
+    "chrome99": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/99.0.4844.51 Safari/537.36"
+    ),
+}
 
 
 def _sec_ch_ua_for(impersonate: str) -> str:
-    if "android" in impersonate or "chrome" in impersonate:
-        ver = "131"
-        for token in ("131", "124", "120", "119", "116", "110", "99"):
-            if token in impersonate:
-                ver = token
-                break
-        return (
-            f'"Chromium";v="{ver}", '
-            f'"Google Chrome";v="{ver}", '
-            f'"Not_A Brand";v="24"'
-        )
-    return ""
+    ver = "131"
+    for token in ("131", "124", "120", "116", "110", "99"):
+        if token in impersonate:
+            ver = token
+            break
+    return (
+        f'"Chromium";v="{ver}", '
+        f'"Google Chrome";v="{ver}", '
+        f'"Not_A Brand";v="24"'
+    )
 
 
 class HTTPClient:
-    """Thin async HTTP wrapper with automatic impersonation rotation."""
+    """Async HTTP wrapper. UA always matches impersonate profile."""
 
     __slots__ = (
         "_session",
@@ -57,6 +96,7 @@ class HTTPClient:
         "_sec_ch_ua",
         "_headers",
         "_pool",
+        "_fixed_ua",
     )
 
     def __init__(
@@ -66,51 +106,34 @@ class HTTPClient:
         proxy: Optional[str] = None,
         timeout: float = 30.0,
         pool: Optional[Sequence[str]] = None,
+        user_agent: Optional[str] = None,
     ) -> None:
         self._pool = list(pool or IMPERSONATE_POOL)
-        self._impersonate = impersonate or random.choice(self._pool)
+        self._impersonate = impersonate or "chrome131_android"
+        if self._impersonate not in self._pool:
+            self._pool.insert(0, self._impersonate)
         self._proxy = proxy
         self._timeout = timeout
-        self._ua = self._ua_for(self._impersonate)
+        self._fixed_ua = user_agent
+        self._ua = user_agent or UA_FOR_IMPERSONATE.get(
+            self._impersonate,
+            UA_FOR_IMPERSONATE["chrome131_android"],
+        )
         self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
+        mobile = "android" in self._impersonate
         self._headers: Dict[str, str] = {
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "Origin": "https://duck.ai",
             "Referer": "https://duck.ai/",
+            "sec-ch-ua": self._sec_ch_ua,
+            "sec-ch-ua-mobile": "?1" if mobile else "?0",
+            "sec-ch-ua-platform": '"Android"' if mobile else '"Windows"',
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
         }
-        if self._sec_ch_ua:
-            self._headers["sec-ch-ua"] = self._sec_ch_ua
-            self._headers["sec-ch-ua-mobile"] = (
-                "?1" if "android" in self._impersonate else "?0"
-            )
-            self._headers["sec-ch-ua-platform"] = (
-                '"Android"' if "android" in self._impersonate else '"Windows"'
-            )
         self._session: Optional[AsyncSession] = None
-
-    @staticmethod
-    def _ua_for(impersonate: str) -> str:
-        if "android" in impersonate:
-            return (
-                "Mozilla/5.0 (Linux; Android 16; moto g play - 2026) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Mobile Safari/537.36"
-            )
-        if "safari" in impersonate:
-            return (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Mobile/15E148 Safari/604.1"
-            )
-        return (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
 
     async def _ensure(self) -> AsyncSession:
         if self._session is None:
@@ -119,37 +142,45 @@ class HTTPClient:
                     impersonate=self._impersonate,
                     proxy=self._proxy,
                     timeout=self._timeout,
-                    headers=self._headers,
                 )
-            except Exception:
+            except Exception as e:
+                log.warning("impersonate {} failed: {} — rotating", self._impersonate, e)
                 self.rotate()
                 self._session = AsyncSession(
                     impersonate=self._impersonate,
                     proxy=self._proxy,
                     timeout=self._timeout,
-                    headers=self._headers,
                 )
         return self._session
 
     def rotate(self) -> None:
-        candidates = [p for p in self._pool if p != self._impersonate] or self._pool[:]
-        self._impersonate = random.choice(candidates)
-        self._ua = self._ua_for(self._impersonate)
-        self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
-        self._headers["sec-ch-ua"] = self._sec_ch_ua
-        self._headers["sec-ch-ua-mobile"] = (
-            "?1" if "android" in self._impersonate else "?0"
-        )
-        self._headers["sec-ch-ua-platform"] = (
-            '"Android"' if "android" in self._impersonate else '"Windows"'
-        )
+        if self._fixed_ua:
+            # User pinned a UA — only rotate TLS profile, keep UA stable for PoW
+            candidates = [p for p in self._pool if p != self._impersonate] or self._pool[:]
+            self._impersonate = random.choice(candidates)
+            log.debug("rotated impersonate -> {} (UA pinned)", self._impersonate)
+        else:
+            candidates = [p for p in self._pool if p != self._impersonate] or self._pool[:]
+            self._impersonate = random.choice(candidates)
+            self._ua = UA_FOR_IMPERSONATE.get(
+                self._impersonate,
+                UA_FOR_IMPERSONATE["chrome131_android"],
+            )
+            self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
+            mobile = "android" in self._impersonate
+            self._headers["sec-ch-ua"] = self._sec_ch_ua
+            self._headers["sec-ch-ua-mobile"] = "?1" if mobile else "?0"
+            self._headers["sec-ch-ua-platform"] = (
+                '"Android"' if mobile else '"Windows"'
+            )
+            log.debug("rotated impersonate -> {}", self._impersonate)
+
         if self._session is not None:
             try:
                 asyncio.get_event_loop().create_task(self._session.close())
             except Exception:
                 pass
             self._session = None
-        log.debug("rotated impersonate -> {}", self._impersonate)
 
     @property
     def user_agent(self) -> str:
@@ -175,9 +206,11 @@ class HTTPClient:
     ) -> Response:
         session = await self._ensure()
         hdrs = dict(self._headers)
+        # Force the same UA we hashed for PoW — critical
         hdrs["User-Agent"] = self._ua
         if headers:
             hdrs.update(headers)
+        hdrs["User-Agent"] = self._ua
 
         kwargs: Dict[str, Any] = {"headers": hdrs, "params": params}
         if json is not None:
@@ -198,7 +231,13 @@ class HTTPClient:
         if resp.status_code == 429:
             raise RateLimitError("rate limited", status=429)
         if resp.status_code == 418:
-            raise AuthError("challenge rejected (418)", status=418)
+            body = ""
+            try:
+                body = resp.text[:400]
+            except Exception:
+                pass
+            log.warning("418 body: {}", body)
+            raise AuthError(f"challenge rejected (418): {body}", status=418)
         if resp.status_code >= 400:
             body = resp.text[:300] if resp.text else ""
             raise HTTPException(
@@ -218,9 +257,3 @@ class HTTPClient:
         if self._session is not None:
             await self._session.close()
             self._session = None
-
-    async def __aenter__(self) -> "HTTPClient":
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        await self.close()

@@ -30,32 +30,12 @@ BASE = "https://duck.ai"
 STATUS_URL = f"{BASE}/duckchat/v1/status"
 CHAT_URL = f"{BASE}/duckchat/v1/chat"
 MODELS_URL = f"{BASE}/duckchat/v1/models"
-CAPABILITIES_URL = f"{BASE}/duckchat/v1/capabilities"
 
 FE_VERSION = "serp_20261117_201536_ET-1fa5b033293521d7ce8eee3f19c13def14a59cf5"
 
 
 class Client:
-    """Async client for Duck.ai (DuckDuckGo AI Chat).
-
-    Parameters
-    ----------
-    impersonate: str | None
-        Preferred curl_cffi impersonation target.
-    proxy: str | None
-        Optional proxy URL.
-    model: str | Model
-        Default model.
-    system: str | None
-        Optional system prompt (prepended into the first user message).
-    max_retries: int
-        How many times to refresh challenge / rotate on failure.
-    log_level: str
-        Loguru level.
-    solved_hash: str | None
-        Optional pre-solved x-vqd-hash-1 captured from a real browser.
-        Use this when the pure-Python solver gets 418 ERR_CHALLENGE.
-    """
+    """Async client for Duck.ai."""
 
     __slots__ = (
         "_http",
@@ -75,20 +55,22 @@ class Client:
     def __init__(
         self,
         *,
-        impersonate: Optional[str] = None,
+        impersonate: Optional[str] = "chrome131_android",
         proxy: Optional[str] = None,
         model: Union[str, Model] = Model.GPT_6_LUNA,
         system: Optional[str] = None,
-        max_retries: int = 6,
+        max_retries: int = 5,
         log_level: str = "INFO",
         pool: Optional[Sequence[str]] = None,
         solved_hash: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ) -> None:
         setup_logging(log_level)
         self._http = HTTPClient(
             impersonate=impersonate,
             proxy=proxy,
             pool=pool or IMPERSONATE_POOL,
+            user_agent=user_agent,
         )
         self._model = str(model)
         self._system = system
@@ -111,14 +93,6 @@ class Client:
         self._model = str(value)
 
     @property
-    def system(self) -> Optional[str]:
-        return self._system
-
-    @system.setter
-    def system(self, value: Optional[str]) -> None:
-        self._system = value
-
-    @property
     def history(self) -> List[Dict[str, Any]]:
         return list(self._history)
 
@@ -127,7 +101,6 @@ class Client:
         self._conversation_id = str(uuid.uuid4())
 
     def reset_session(self) -> None:
-        """Drop tokens + history (guest session refresh)."""
         self._hash1 = self._solved_hash
         self._vqd4 = None
         self._last_refresh = 0.0
@@ -177,12 +150,12 @@ class Client:
             return
 
         now = time.monotonic()
-        if not force and self._hash1 and (now - self._last_refresh) < 30:
+        if not force and self._hash1 and (now - self._last_refresh) < 25:
             return
 
         async with self._lock:
             now = time.monotonic()
-            if not force and self._hash1 and (now - self._last_refresh) < 30:
+            if not force and self._hash1 and (now - self._last_refresh) < 25:
                 return
 
             for attempt in range(1, self._max_retries + 1):
@@ -195,25 +168,24 @@ class Client:
                         },
                     )
                     headers = dict(resp.headers)
+                    # Hash with the SAME UA the HTTP layer will send
                     solved, vqd4 = solve_from_status(
                         headers,
                         self._http.user_agent,
                         sec_ch_ua=self._http.sec_ch_ua,
                         origin=BASE,
                     )
-                    if not solved and not vqd4 and not self._solved_hash:
+                    if not solved and not self._solved_hash:
                         raise ChallengeError("no challenge tokens in status")
 
-                    if self._solved_hash:
-                        self._hash1 = self._solved_hash
-                    elif solved:
-                        self._hash1 = solved
+                    self._hash1 = self._solved_hash or solved
                     if vqd4:
                         self._vqd4 = vqd4
                     self._last_refresh = time.monotonic()
                     log.info(
-                        "tokens refreshed  imp={}  vqd4={}  hash_len={}",
+                        "tokens refreshed  imp={}  ua={}...  vqd4={}  hash_len={}",
                         self._http.impersonate,
+                        self._http.user_agent[:40],
                         bool(self._vqd4),
                         len(self._hash1 or ""),
                     )
@@ -221,11 +193,11 @@ class Client:
                 except (AuthError, ChallengeError, HTTPException, RateLimitError) as e:
                     log.warning("refresh attempt {} failed: {}", attempt, e)
                     self._http.rotate()
-                    await asyncio.sleep(0.4 * attempt)
+                    await asyncio.sleep(0.35 * attempt)
                 except Exception as e:
                     log.warning("refresh unexpected: {}", e)
                     self._http.rotate()
-                    await asyncio.sleep(0.5 * attempt)
+                    await asyncio.sleep(0.45 * attempt)
 
             if self._solved_hash:
                 self._hash1 = self._solved_hash
@@ -265,24 +237,6 @@ class Client:
         if not self._hash1 and not self._vqd4:
             await self._refresh_tokens(force=True)
 
-    async def models(self) -> List[ModelInfo]:
-        await self._ensure_ready()
-        resp = await self._http.get(MODELS_URL, headers=self._chat_headers())
-        data = orjson.loads(resp.content)
-        out: List[ModelInfo] = []
-        for item in data if isinstance(data, list) else data.get("models", []):
-            out.append(
-                ModelInfo(
-                    model=item.get("model", ""),
-                    model_name=item.get("modelName", ""),
-                    input_char_limit=str(item.get("inputCharLimit", "")),
-                    created_by=item.get("createdBy", ""),
-                    is_open_source=bool(item.get("isOpenSource", False)),
-                    raw=item,
-                )
-            )
-        return out
-
     async def chat(
         self,
         content: str,
@@ -291,7 +245,6 @@ class Client:
         system: Optional[str] = None,
         history: bool = True,
     ) -> ChatResult:
-        """Send a message and return the full response."""
         await self._ensure_ready()
         model_s = str(model or self._model)
         messages = self._build_messages(content, history=history, system=system)
@@ -317,27 +270,26 @@ class Client:
                     self._history.append(
                         {"role": "assistant", "content": self._content_blocks(text)}
                     )
-
                 return ChatResult(content=text, model=model_s, vqd=self._vqd4)
             except AuthError as e:
                 last_err = e
                 log.warning("chat auth fail attempt {} — refreshing", attempt)
+                # Keep UA stable; only refresh challenge
+                self._hash1 = None
                 await self._refresh_tokens(force=True)
-                self._http.rotate()
             except RateLimitError as e:
                 last_err = e
-                log.warning("rate limited / usage limit — resetting guest session")
+                log.warning("rate limited — reset guest session")
                 self.reset_session()
                 await self._refresh_tokens(force=True)
-                self._http.rotate()
-                await asyncio.sleep(1.2 * attempt)
+                await asyncio.sleep(1.0 * attempt)
             except HTTPException as e:
                 last_err = e
                 log.warning("http error attempt {}: {}", attempt, e)
                 if getattr(e, "status", None) in (400, 418):
+                    self._hash1 = None
                     await self._refresh_tokens(force=True)
-                self._http.rotate()
-                await asyncio.sleep(0.4 * attempt)
+                await asyncio.sleep(0.35 * attempt)
 
         raise DuckAIException(f"chat failed after retries: {last_err}")
 
@@ -349,7 +301,6 @@ class Client:
         system: Optional[str] = None,
         history: bool = True,
     ) -> AsyncIterator[StreamChunk]:
-        """Stream a response as SSE chunks."""
         await self._ensure_ready()
         model_s = str(model or self._model)
         messages = self._build_messages(content, history=history, system=system)
@@ -385,18 +336,16 @@ class Client:
                 return
             except AuthError:
                 log.warning("stream auth fail — refresh")
+                self._hash1 = None
                 await self._refresh_tokens(force=True)
-                self._http.rotate()
             except RateLimitError:
-                log.warning("stream rate limited — reset session")
+                log.warning("stream rate limited — reset")
                 self.reset_session()
                 await self._refresh_tokens(force=True)
-                self._http.rotate()
-                await asyncio.sleep(1.2 * attempt)
+                await asyncio.sleep(1.0 * attempt)
             except Exception as e:
                 log.warning("stream error: {}", e)
-                self._http.rotate()
-                await asyncio.sleep(0.4 * attempt)
+                await asyncio.sleep(0.35 * attempt)
 
         raise DuckAIException("stream failed after retries")
 
