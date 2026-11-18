@@ -30,7 +30,6 @@ BASE = "https://duck.ai"
 STATUS_URL = f"{BASE}/duckchat/v1/status"
 CHAT_URL = f"{BASE}/duckchat/v1/chat"
 MODELS_URL = f"{BASE}/duckchat/v1/models"
-AUTH_URL = f"{BASE}/duckchat/v1/auth/token"
 CAPABILITIES_URL = f"{BASE}/duckchat/v1/capabilities"
 
 FE_VERSION = "serp_20261117_201536_ET-1fa5b033293521d7ce8eee3f19c13def14a59cf5"
@@ -48,11 +47,14 @@ class Client:
     model: str | Model
         Default model.
     system: str | None
-        Optional system prompt (prepended into first user message).
+        Optional system prompt (prepended into the first user message).
     max_retries: int
         How many times to refresh challenge / rotate on failure.
     log_level: str
         Loguru level.
+    solved_hash: str | None
+        Optional pre-solved x-vqd-hash-1 captured from a real browser.
+        Use this when the pure-Python solver gets 418 ERR_CHALLENGE.
     """
 
     __slots__ = (
@@ -65,8 +67,9 @@ class Client:
         "_history",
         "_lock",
         "_last_refresh",
-        "_journey",
+        "_solved_hash",
         "_conversation_id",
+        "_journey_id",
     )
 
     def __init__(
@@ -79,24 +82,25 @@ class Client:
         max_retries: int = 6,
         log_level: str = "INFO",
         pool: Optional[Sequence[str]] = None,
+        solved_hash: Optional[str] = None,
     ) -> None:
         setup_logging(log_level)
         self._http = HTTPClient(
             impersonate=impersonate,
             proxy=proxy,
             pool=pool or IMPERSONATE_POOL,
-            origin=BASE,
         )
         self._model = str(model)
         self._system = system
         self._vqd4: Optional[str] = None
-        self._hash1: Optional[str] = None
+        self._hash1: Optional[str] = solved_hash
+        self._solved_hash = solved_hash
         self._max_retries = max_retries
         self._history: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self._last_refresh = 0.0
-        self._journey = uuid.uuid4().hex
         self._conversation_id = str(uuid.uuid4())
+        self._journey_id = uuid.uuid4().hex
 
     @property
     def model(self) -> str:
@@ -122,17 +126,16 @@ class Client:
         self._history.clear()
         self._conversation_id = str(uuid.uuid4())
 
-    def new_session(self) -> None:
-        """Reset guest session (usage limit / memory boundary)."""
-        self.clear_history()
-        self._journey = uuid.uuid4().hex
-        self._hash1 = None
+    def reset_session(self) -> None:
+        """Drop tokens + history (guest session refresh)."""
+        self._hash1 = self._solved_hash
         self._vqd4 = None
         self._last_refresh = 0.0
-        log.info("guest session reset")
+        self.clear_history()
+        self._journey_id = uuid.uuid4().hex
 
     @staticmethod
-    def _text_content(text: str) -> List[Dict[str, str]]:
+    def _content_blocks(text: str) -> List[Dict[str, str]]:
         return [{"type": "text", "text": text}]
 
     def _build_messages(
@@ -151,7 +154,9 @@ class Client:
         if sys_prompt and not messages:
             user_text = f"{sys_prompt.strip()}\n\n{content}"
 
-        messages.append({"role": "user", "content": self._text_content(user_text)})
+        messages.append(
+            {"role": "user", "content": self._content_blocks(user_text)}
+        )
         return messages
 
     def _fe_signals(self) -> str:
@@ -167,6 +172,10 @@ class Client:
         return b64encode(orjson.dumps(payload)).decode("ascii")
 
     async def _refresh_tokens(self, force: bool = False) -> None:
+        if self._solved_hash and not force:
+            self._hash1 = self._solved_hash
+            return
+
         now = time.monotonic()
         if not force and self._hash1 and (now - self._last_refresh) < 30:
             return
@@ -182,9 +191,7 @@ class Client:
                         STATUS_URL,
                         headers={
                             "x-vqd-accept": "1",
-                            "Accept": "*/*",
-                            "cache-control": "no-store",
-                            "x-ddg-journey-id": self._journey,
+                            "Accept": "text/event-stream",
                         },
                     )
                     headers = dict(resp.headers)
@@ -194,10 +201,12 @@ class Client:
                         sec_ch_ua=self._http.sec_ch_ua,
                         origin=BASE,
                     )
-                    if not solved and not vqd4:
-                        raise ChallengeError("no x-vqd-hash-1 or x-vqd-4 in status")
+                    if not solved and not vqd4 and not self._solved_hash:
+                        raise ChallengeError("no challenge tokens in status")
 
-                    if solved:
+                    if self._solved_hash:
+                        self._hash1 = self._solved_hash
+                    elif solved:
                         self._hash1 = solved
                     if vqd4:
                         self._vqd4 = vqd4
@@ -218,22 +227,39 @@ class Client:
                     self._http.rotate()
                     await asyncio.sleep(0.5 * attempt)
 
+            if self._solved_hash:
+                self._hash1 = self._solved_hash
+                return
             raise ChallengeError("failed to obtain valid VQD tokens after retries")
 
     def _chat_headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "x-ddg-journey-id": self._journey,
             "x-fe-version": FE_VERSION,
             "x-fe-signals": self._fe_signals(),
-            "x-duckai-consent-purposes": "user-location,image-generation,web-search",
+            "x-ddg-journey-id": self._journey_id,
         }
         if self._hash1:
             h["x-vqd-hash-1"] = self._hash1
         if self._vqd4:
             h["x-vqd-4"] = self._vqd4
         return h
+
+    def _chat_body(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+    ) -> Dict[str, Any]:
+        return {
+            "model": model,
+            "messages": messages,
+            "canUseTools": True,
+            "reasoningEffort": "none",
+            "canUseApproxLocation": None,
+            "canDelegateImageGeneration": None,
+            "canShowGreeting": False,
+        }
 
     async def _ensure_ready(self) -> None:
         if not self._hash1 and not self._vqd4:
@@ -268,15 +294,8 @@ class Client:
         """Send a message and return the full response."""
         await self._ensure_ready()
         model_s = str(model or self._model)
-
         messages = self._build_messages(content, history=history, system=system)
-        body: Dict[str, Any] = {
-            "model": model_s,
-            "messages": messages,
-            "canUseTools": True,
-            "reasoningEffort": "none",
-            "canShowGreeting": False,
-        }
+        body = self._chat_body(messages, model_s)
 
         last_err: Optional[Exception] = None
         for attempt in range(1, self._max_retries + 1):
@@ -291,27 +310,15 @@ class Client:
                     self._vqd4 = new_vqd
 
                 text = self._parse_sse(resp.content)
-
-                # usage / guest limit signals in SSE
-                if "ERR_USAGE" in (resp.content.decode("utf-8", errors="ignore")):
-                    log.warning("usage limit hit — resetting guest session")
-                    self.new_session()
-                    await self._refresh_tokens(force=True)
-                    continue
-
                 if history:
                     self._history.append(
-                        {"role": "user", "content": self._text_content(content)}
+                        {"role": "user", "content": self._content_blocks(content)}
                     )
                     self._history.append(
-                        {"role": "assistant", "content": self._text_content(text)}
+                        {"role": "assistant", "content": self._content_blocks(text)}
                     )
 
-                return ChatResult(
-                    content=text,
-                    model=model_s,
-                    vqd=self._vqd4,
-                )
+                return ChatResult(content=text, model=model_s, vqd=self._vqd4)
             except AuthError as e:
                 last_err = e
                 log.warning("chat auth fail attempt {} — refreshing", attempt)
@@ -319,9 +326,11 @@ class Client:
                 self._http.rotate()
             except RateLimitError as e:
                 last_err = e
-                log.warning("rate limited, rotating + sleep")
+                log.warning("rate limited / usage limit — resetting guest session")
+                self.reset_session()
+                await self._refresh_tokens(force=True)
                 self._http.rotate()
-                await asyncio.sleep(1.5 * attempt)
+                await asyncio.sleep(1.2 * attempt)
             except HTTPException as e:
                 last_err = e
                 log.warning("http error attempt {}: {}", attempt, e)
@@ -343,15 +352,8 @@ class Client:
         """Stream a response as SSE chunks."""
         await self._ensure_ready()
         model_s = str(model or self._model)
-
         messages = self._build_messages(content, history=history, system=system)
-        body: Dict[str, Any] = {
-            "model": model_s,
-            "messages": messages,
-            "canUseTools": True,
-            "reasoningEffort": "none",
-            "canShowGreeting": False,
-        }
+        body = self._chat_body(messages, model_s)
 
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -372,12 +374,12 @@ class Client:
 
                 if history and full:
                     self._history.append(
-                        {"role": "user", "content": self._text_content(content)}
+                        {"role": "user", "content": self._content_blocks(content)}
                     )
                     self._history.append(
                         {
                             "role": "assistant",
-                            "content": self._text_content("".join(full)),
+                            "content": self._content_blocks("".join(full)),
                         }
                     )
                 return
@@ -386,6 +388,9 @@ class Client:
                 await self._refresh_tokens(force=True)
                 self._http.rotate()
             except RateLimitError:
+                log.warning("stream rate limited — reset session")
+                self.reset_session()
+                await self._refresh_tokens(force=True)
                 self._http.rotate()
                 await asyncio.sleep(1.2 * attempt)
             except Exception as e:
@@ -407,12 +412,6 @@ class Client:
             try:
                 obj = orjson.loads(data)
                 if isinstance(obj, dict):
-                    if obj.get("action") == "error":
-                        raise HTTPException(
-                            f"SSE error: {obj.get('type') or obj}",
-                            status=int(obj.get("status") or 400),
-                            payload=str(obj),
-                        )
                     msg = obj.get("message") or obj.get("content") or ""
                     if isinstance(msg, list):
                         msg = "".join(
@@ -421,8 +420,6 @@ class Client:
                         )
                     if msg:
                         parts.append(str(msg))
-            except HTTPException:
-                raise
             except Exception:
                 if data and not data.startswith("{"):
                     parts.append(data)

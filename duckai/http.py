@@ -57,7 +57,6 @@ class HTTPClient:
         "_sec_ch_ua",
         "_headers",
         "_pool",
-        "_origin",
     )
 
     def __init__(
@@ -67,20 +66,18 @@ class HTTPClient:
         proxy: Optional[str] = None,
         timeout: float = 30.0,
         pool: Optional[Sequence[str]] = None,
-        origin: str = "https://duck.ai",
     ) -> None:
         self._pool = list(pool or IMPERSONATE_POOL)
         self._impersonate = impersonate or random.choice(self._pool)
         self._proxy = proxy
         self._timeout = timeout
-        self._origin = origin.rstrip("/")
         self._ua = self._ua_for(self._impersonate)
         self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
         self._headers: Dict[str, str] = {
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Origin": self._origin,
-            "Referer": self._origin + "/",
+            "Origin": "https://duck.ai",
+            "Referer": "https://duck.ai/",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -203,7 +200,7 @@ class HTTPClient:
         if resp.status_code == 418:
             raise AuthError("challenge rejected (418)", status=418)
         if resp.status_code >= 400:
-            body = resp.text[:400] if resp.text else ""
+            body = resp.text[:300] if resp.text else ""
             raise HTTPException(
                 f"HTTP {resp.status_code}: {body}",
                 status=resp.status_code,

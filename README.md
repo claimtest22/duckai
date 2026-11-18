@@ -1,27 +1,13 @@
 # ddgai
 
-High-performance reverse-engineered **Duck.ai** (DuckDuckGo AI Chat) client.
+High-performance reverse-engineered **Duck.ai** client.
 
 Made by **frat**.
-
-## Features
-
-- Pure-Python static solver for the `x-vqd-hash-1` challenge
-- Automatic token refresh + impersonation rotation on 418 / 429
-- Full `curl_cffi` browser impersonation pool (desktop + mobile)
-- Custom system prompts (per-client or per-call)
-- Streaming + non-streaming chat
-- Conversation history
-- orjson + async for minimal overhead
-- loguru logging
-- discord.py-style structure & type hints
 
 ## Install
 
 ```bash
-pip install ddgai
-# or from source
-pip install -e .
+pip install -U ddgai
 ```
 
 ## Quick start
@@ -31,72 +17,60 @@ import asyncio
 from duckai import Client, Model
 
 async def main():
-    async with Client(model=Model.GPT_4O_MINI) as client:
-        result = await client.chat("ping")
-        print(result.content)
+    async with Client(model=Model.GPT_6_LUNA) as client:
+        r = await client.chat("say hi")
+        print(r.content)
 
 asyncio.run(main())
-```
-
-## System prompts
-
-```python
-async with Client(
-    model=Model.GPT_4O_MINI,
-    system="You are a concise senior engineer. Answer in short bullets only.",
-) as client:
-    r = await client.chat("How do I read a file asynchronously in Python?")
-    print(r.content)
-
-    # one-off override
-    r2 = await client.chat(
-        "Explain generators",
-        system="You only speak like a pirate. Max 2 sentences.",
-        history=False,
-    )
 ```
 
 ## Streaming
 
 ```python
 async with Client() as client:
-    async for chunk in client.stream("explain quantum computing in one sentence"):
+    async for chunk in client.stream("explain async in one sentence"):
         if chunk.content:
             print(chunk.content, end="", flush=True)
 ```
 
-## Multi-turn history
+## System prompts
+
+Duck.ai has no `system` role. Prompts are prepended into the first user message.
 
 ```python
-async with Client() as client:
-    await client.chat("My name is Alex")
-    r = await client.chat("What is my name?")
-    print(r.content)
-    client.clear_history()
+async with Client(system="Answer in 3 words max.") as client:
+    print((await client.chat("What is Python?")).content)
 ```
 
-## Models
+## Usage limit / guest reset
+
+When free-tier usage is exhausted the client resets the guest session automatically.
+You can also force it:
 
 ```python
-models = await client.models()
-for m in models:
-    print(m.model, m.model_name)
+client.reset_session()
 ```
 
-## Examples
+## Challenge / 418 ERR_CHALLENGE
 
-See the `examples/` directory:
+The live `x-vqd-hash-1` PoW needs real DOM metrics. Pure-Python is best-effort.
 
-- `basic.py` — one-shot chat
-- `system_prompt.py` — custom system prompts
-- `stream.py` — streaming
-- `history.py` — multi-turn
+**Most reliable:** capture a solved hash from your browser (Network tab → chat request → `x-vqd-hash-1`) and pass it in:
+
+```python
+async with Client(solved_hash="eyJ...") as client:
+    print((await client.chat("hi")).content)
+```
+
+Optional Node.js fallback is used automatically when `node` is on PATH.
+
+Acode does **not** run browser JS for this. Termux + Node can.
 
 ## Notes
 
-- The challenge solver is a pure-Python static reimplementation. It works for the current generation of challenges. When DuckDuckGo rotates the challenge heavily the client auto-retries and rotates fingerprints.
-- Datacenter IPs are frequently blocked or rate-limited. Prefer residential proxies for production use.
-- Respect DuckDuckGo ToS.
+- Host: `https://duck.ai`
+- Message content is typed blocks: `{"type":"text","text":"..."}`
+- Default model: `gpt-6-luna`
 
 ## License
 
