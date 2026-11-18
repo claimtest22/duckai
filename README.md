@@ -1,4 +1,4 @@
-# frat-duckchat
+# ddgai
 
 High-performance reverse-engineered **Duck.ai** (DuckDuckGo AI Chat) client.
 
@@ -19,7 +19,7 @@ Made by **frat**.
 ## Install
 
 ```bash
-pip install frat-duckchat
+pip install ddgai
 # or from source
 pip install -e .
 ```
