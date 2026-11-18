@@ -10,7 +10,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Union
 
 import orjson
 
-from .challenge import solve_from_status, solve_static
+from .challenge import solve_from_status
 from .enums import Model
 from .errors import (
     AuthError,
@@ -21,7 +21,7 @@ from .errors import (
 )
 from .http import HTTPClient, IMPERSONATE_POOL
 from .logging import log, setup_logging
-from .models import ChatResult, Message, ModelInfo, StreamChunk
+from .models import ChatResult, ModelInfo, StreamChunk
 
 
 STATUS_URL = "https://duckduckgo.com/duckchat/v1/status"
@@ -42,6 +42,7 @@ class Client:
         Default model.
     system: str | None
         Optional system prompt applied to every request.
+        Note: Duck.ai has no system role — this is prepended into the first user message.
     max_retries: int
         How many times to refresh challenge / rotate on failure.
     log_level: str
@@ -96,7 +97,6 @@ class Client:
 
     @property
     def system(self) -> Optional[str]:
-        """Current system prompt (if any)."""
         return self._system
 
     @system.setter
@@ -117,11 +117,7 @@ class Client:
         history: bool,
         system: Optional[str] = None,
     ) -> List[Dict[str, str]]:
-        """Build the messages list.
-
-        Duck.ai only accepts roles ``user`` and ``assistant``.
-        System prompts are prepended into the first user message.
-        """
+        """Build messages. Duck.ai only accepts user/assistant roles."""
         messages: List[Dict[str, str]] = []
         if history:
             messages.extend(self._history)
@@ -130,8 +126,6 @@ class Client:
         user_content = content
         if sys_prompt and not messages:
             user_content = f"{sys_prompt.strip()}\n\n{content}"
-        elif sys_prompt and messages:
-            pass
 
         messages.append({"role": "user", "content": user_content})
         return messages
@@ -151,17 +145,19 @@ class Client:
                 try:
                     resp = await self._http.get(
                         STATUS_URL,
-                        headers={"x-vqd-accept": "1"},
+                        headers={"x-vqd-accept": "1", "Accept": "text/event-stream"},
                     )
                     headers = dict(resp.headers)
                     solved, vqd4 = solve_from_status(
                         headers,
                         self._http.user_agent,
+                        sec_ch_ua=self._http.sec_ch_ua,
                     )
-                    if not solved:
-                        raise ChallengeError("no x-vqd-hash-1 in status response")
+                    if not solved and not vqd4:
+                        raise ChallengeError("no x-vqd-hash-1 or x-vqd-4 in status response")
 
-                    self._hash1 = solved
+                    if solved:
+                        self._hash1 = solved
                     if vqd4:
                         self._vqd4 = vqd4
                     self._last_refresh = time.monotonic()
@@ -169,7 +165,7 @@ class Client:
                         "tokens refreshed  imp={}  vqd4={}  hash_len={}",
                         self._http.impersonate,
                         bool(self._vqd4),
-                        len(self._hash1),
+                        len(self._hash1 or ""),
                     )
                     return
                 except (AuthError, ChallengeError, HTTPException, RateLimitError) as e:
@@ -187,14 +183,15 @@ class Client:
         h: Dict[str, str] = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "x-vqd-hash-1": self._hash1 or "",
         }
+        if self._hash1:
+            h["x-vqd-hash-1"] = self._hash1
         if self._vqd4:
             h["x-vqd-4"] = self._vqd4
         return h
 
     async def _ensure_ready(self) -> None:
-        if not self._hash1:
+        if not self._hash1 and not self._vqd4:
             await self._refresh_tokens(force=True)
 
     async def models(self) -> List[ModelInfo]:
@@ -224,28 +221,12 @@ class Client:
         system: Optional[str] = None,
         history: bool = True,
     ) -> ChatResult:
-        """Send a message and return the full response.
-
-        Parameters
-        ----------
-        content: str
-            User message.
-        model: str | Model | None
-            Override default model.
-        system: str | None
-            Optional system prompt override for this call.
-        history: bool
-            Whether to keep conversation history.
-        """
+        """Send a message and return the full response."""
         await self._ensure_ready()
         model_s = str(model or self._model)
 
         messages = self._build_messages(content, history=history, system=system)
-
-        body = {
-            "model": model_s,
-            "messages": messages,
-        }
+        body = {"model": model_s, "messages": messages}
 
         last_err: Optional[Exception] = None
         for attempt in range(1, self._max_retries + 1):
@@ -282,6 +263,9 @@ class Client:
             except HTTPException as e:
                 last_err = e
                 log.warning("http error attempt {}: {}", attempt, e)
+                # 400 often means bad hash or bad body — force refresh
+                if getattr(e, "status", None) == 400:
+                    await self._refresh_tokens(force=True)
                 self._http.rotate()
                 await asyncio.sleep(0.4 * attempt)
 
@@ -295,28 +279,12 @@ class Client:
         system: Optional[str] = None,
         history: bool = True,
     ) -> AsyncIterator[StreamChunk]:
-        """Stream a response as SSE chunks.
-
-        Parameters
-        ----------
-        content: str
-            User message.
-        model: str | Model | None
-            Override default model.
-        system: str | None
-            Optional system prompt override for this call.
-        history: bool
-            Whether to keep conversation history.
-        """
+        """Stream a response as SSE chunks."""
         await self._ensure_ready()
         model_s = str(model or self._model)
 
         messages = self._build_messages(content, history=history, system=system)
-
-        body = {
-            "model": model_s,
-            "messages": messages,
-        }
+        body = {"model": model_s, "messages": messages}
 
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -354,7 +322,6 @@ class Client:
         raise DuckAIException("stream failed after retries")
 
     def _parse_sse(self, raw: bytes) -> str:
-        """Parse a full SSE body into a single string."""
         text = raw.decode("utf-8", errors="replace")
         parts: List[str] = []
         for line in text.splitlines():
@@ -375,7 +342,6 @@ class Client:
         return "".join(parts)
 
     async def _iter_sse(self, resp: Any) -> AsyncIterator[StreamChunk]:
-        """Yield StreamChunk from response content (already buffered by curl_cffi)."""
         text = resp.content.decode("utf-8", errors="replace")
         for line in text.splitlines():
             if not line.startswith("data:"):
