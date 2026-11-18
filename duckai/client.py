@@ -117,14 +117,23 @@ class Client:
         history: bool,
         system: Optional[str] = None,
     ) -> List[Dict[str, str]]:
-        """Build the messages list, optionally injecting a system prompt."""
+        """Build the messages list.
+
+        Duck.ai only accepts roles ``user`` and ``assistant``.
+        System prompts are prepended into the first user message.
+        """
         messages: List[Dict[str, str]] = []
-        sys_prompt = system if system is not None else self._system
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
         if history:
             messages.extend(self._history)
-        messages.append({"role": "user", "content": content})
+
+        sys_prompt = system if system is not None else self._system
+        user_content = content
+        if sys_prompt and not messages:
+            user_content = f"{sys_prompt.strip()}\n\n{content}"
+        elif sys_prompt and messages:
+            pass
+
+        messages.append({"role": "user", "content": user_content})
         return messages
 
     async def _refresh_tokens(self, force: bool = False) -> None:
