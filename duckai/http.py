@@ -15,7 +15,6 @@ from .logging import log
 from .errors import HTTPException, RateLimitError, AuthError
 
 
-# Ordered by preference / observed success on duck.ai
 IMPERSONATE_POOL: List[str] = [
     "chrome131",
     "chrome136",
@@ -62,8 +61,8 @@ class HTTPClient:
         self._headers: Dict[str, str] = {
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://duck.ai",
-            "Referer": "https://duck.ai/",
+            "Origin": "https://duckduckgo.com",
+            "Referer": "https://duckduckgo.com/",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
