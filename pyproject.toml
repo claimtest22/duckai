@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duckai"
+version = "1.0.0"
+description = "High-performance reverse-engineered Duck.ai (DuckDuckGo AI Chat) client"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "frat"}
+]
+keywords = ["duck.ai", "duckduckgo", "ai", "chat", "llm"]
+dependencies = [
+    "curl_cffi>=0.7.0",
+    "orjson>=3.9.0",
+    "loguru>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/claimtest22/duckai"
+Repository = "https://github.com/claimtest22/duckai"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["duckai*"]
