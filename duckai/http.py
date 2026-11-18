@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence
 
 import orjson
 from curl_cffi.requests import AsyncSession, Response
@@ -15,21 +15,39 @@ from .logging import log
 from .errors import HTTPException, RateLimitError, AuthError
 
 
+# Keep only widely-supported profiles (Android / older curl_cffi safe)
 IMPERSONATE_POOL: List[str] = [
     "chrome131",
-    "chrome136",
     "chrome124",
     "chrome120",
+    "chrome119",
+    "chrome116",
+    "chrome110",
+    "chrome107",
+    "chrome104",
+    "chrome99",
     "chrome131_android",
     "chrome99_android",
-    "safari18_0",
     "safari17_0",
-    "safari18_0_ios",
-    "safari17_2_ios",
-    "chrome152",
-    "firefox135",
-    "edge101",
+    "safari15_5",
+    "safari15_3",
 ]
+
+
+def _sec_ch_ua_for(impersonate: str) -> str:
+    if "android" in impersonate or "chrome" in impersonate:
+        # Approximate brands string matching major chrome versions
+        ver = "131"
+        for token in ("131", "124", "120", "119", "116", "110", "107", "104", "99"):
+            if token in impersonate:
+                ver = token
+                break
+        return (
+            f'"Chromium";v="{ver}", '
+            f'"Google Chrome";v="{ver}", '
+            f'"Not_A Brand";v="24"'
+        )
+    return ""
 
 
 class HTTPClient:
@@ -41,6 +59,7 @@ class HTTPClient:
         "_proxy",
         "_timeout",
         "_ua",
+        "_sec_ch_ua",
         "_headers",
         "_pool",
     )
@@ -58,6 +77,7 @@ class HTTPClient:
         self._proxy = proxy
         self._timeout = timeout
         self._ua = self._ua_for(self._impersonate)
+        self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
         self._headers: Dict[str, str] = {
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
@@ -67,6 +87,12 @@ class HTTPClient:
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
         }
+        if self._sec_ch_ua:
+            self._headers["sec-ch-ua"] = self._sec_ch_ua
+            self._headers["sec-ch-ua-mobile"] = "?1" if "android" in self._impersonate else "?0"
+            self._headers["sec-ch-ua-platform"] = (
+                '"Android"' if "android" in self._impersonate else '"Windows"'
+            )
         self._session: Optional[AsyncSession] = None
 
     @staticmethod
@@ -79,14 +105,9 @@ class HTTPClient:
             )
         if "ios" in impersonate or "safari" in impersonate:
             return (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/18.0 Mobile/15E148 Safari/604.1"
-            )
-        if "firefox" in impersonate:
-            return (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
-                "Gecko/20100101 Firefox/135.0"
+                "Version/17.0 Mobile/15E148 Safari/604.1"
             )
         return (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -96,21 +117,37 @@ class HTTPClient:
 
     async def _ensure(self) -> AsyncSession:
         if self._session is None:
-            self._session = AsyncSession(
-                impersonate=self._impersonate,
-                proxy=self._proxy,
-                timeout=self._timeout,
-                headers=self._headers,
-            )
+            try:
+                self._session = AsyncSession(
+                    impersonate=self._impersonate,
+                    proxy=self._proxy,
+                    timeout=self._timeout,
+                    headers=self._headers,
+                )
+            except Exception:
+                # Fallback if this profile is unsupported on this curl_cffi build
+                self.rotate()
+                self._session = AsyncSession(
+                    impersonate=self._impersonate,
+                    proxy=self._proxy,
+                    timeout=self._timeout,
+                    headers=self._headers,
+                )
         return self._session
 
     def rotate(self) -> None:
         """Switch to a different impersonation profile."""
         candidates = [p for p in self._pool if p != self._impersonate]
         if not candidates:
-            candidates = self._pool
+            candidates = self._pool[:]
         self._impersonate = random.choice(candidates)
         self._ua = self._ua_for(self._impersonate)
+        self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
+        self._headers["sec-ch-ua"] = self._sec_ch_ua
+        self._headers["sec-ch-ua-mobile"] = "?1" if "android" in self._impersonate else "?0"
+        self._headers["sec-ch-ua-platform"] = (
+            '"Android"' if "android" in self._impersonate else '"Windows"'
+        )
         if self._session is not None:
             try:
                 asyncio.get_event_loop().create_task(self._session.close())
@@ -122,6 +159,10 @@ class HTTPClient:
     @property
     def user_agent(self) -> str:
         return self._ua
+
+    @property
+    def sec_ch_ua(self) -> str:
+        return self._sec_ch_ua
 
     @property
     def impersonate(self) -> str:
@@ -156,8 +197,11 @@ class HTTPClient:
         try:
             resp = await session.request(method, url, **kwargs)
         except Exception as e:
-            log.warning("request error {} {} -> {}", method, url, e)
-            raise HTTPException(str(e)) from e
+            msg = str(e)
+            log.warning("request error {} {} -> {}", method, url, msg)
+            if "not supported" in msg.lower() or "impersonat" in msg.lower():
+                self.rotate()
+            raise HTTPException(msg) from e
 
         if resp.status_code == 429:
             raise RateLimitError("rate limited", status=429)
