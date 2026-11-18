@@ -8,16 +8,15 @@ from __future__ import annotations
 
 import re
 import time
-from base64 import b64decode, b64encode
+from base64 import b64decode
 from typing import Any, Dict, List, Optional, Tuple
-
-import orjson
 
 from .logging import log
 from .utils import sha256_b64, b64json
 
 
-_DOM_VALUE = "6823"  # classic fixed value seen across many challenges (101 + innerHTML length pattern)
+# Values observed across many live challenges
+_DOM_VALUES = ("6823", "101", "6824", "123")
 
 
 def _extract_server_hashes(script: str) -> List[str]:
@@ -44,12 +43,46 @@ def _extract_meta(script: str) -> Dict[str, str]:
         "timestamp": str(int(time.time() * 1000)),
         "origin": "https://duck.ai",
         "stack": "Error\n    at solve (native)",
-        "duration": "12",
+        "duration": str(8 + int(time.time() * 1000) % 20),
     }
-    ids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", script)
+    ids = re.findall(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        script,
+    )
     if ids:
         meta["challenge_id"] = ids[0]
     return meta
+
+
+def _build_client_raw(user_agent: str) -> List[str]:
+    """Reconstruct the raw values the challenge hashes on the client side."""
+    brands = ""
+    if "Chrome/" in user_agent:
+        try:
+            ver = user_agent.split("Chrome/")[1].split(".")[0]
+            brands = (
+                f'"Chromium";v="{ver}", '
+                f'"Google Chrome";v="{ver}", '
+                f'"Not_A Brand";v="24"'
+            )
+        except Exception:
+            brands = (
+                '"Chromium";v="131", '
+                '"Google Chrome";v="131", '
+                '"Not_A Brand";v="24"'
+            )
+    elif "Firefox/" in user_agent:
+        brands = ""
+    else:
+        brands = (
+            '"Chromium";v="131", '
+            '"Google Chrome";v="131", '
+            '"Not_A Brand";v="24"'
+        )
+
+    ua_key = user_agent + brands
+    dom = _DOM_VALUES[0]
+    return [ua_key, dom]
 
 
 def solve_static(
@@ -83,19 +116,7 @@ def solve_static(
     meta = _extract_meta(script)
     meta["origin"] = origin
 
-    brands = ""
-    if "Chrome/" in user_agent:
-        try:
-            ver = user_agent.split("Chrome/")[1].split(".")[0]
-            brands = f'"Chromium";v="{ver}", "Google Chrome";v="{ver}", "Not_A Brand";v="24"'
-        except Exception:
-            pass
-
-    raw_client = [
-        user_agent + (brands if brands else ""),
-        _DOM_VALUE,
-    ]
-
+    raw_client = _build_client_raw(user_agent)
     client_hashes = [sha256_b64(x) for x in raw_client]
 
     payload: Dict[str, Any] = {
@@ -106,7 +127,11 @@ def solve_static(
     }
 
     solved = b64json(payload)
-    log.debug("challenge solved  client_hashes={}  len={}", len(client_hashes), len(solved))
+    log.debug(
+        "challenge solved  client_hashes={}  len={}",
+        len(client_hashes),
+        len(solved),
+    )
     return solved
 
 
