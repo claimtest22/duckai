@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
+from base64 import b64encode
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Union
 
 import orjson
@@ -24,9 +26,14 @@ from .logging import log, setup_logging
 from .models import ChatResult, ModelInfo, StreamChunk
 
 
-STATUS_URL = "https://duckduckgo.com/duckchat/v1/status"
-CHAT_URL = "https://duckduckgo.com/duckchat/v1/chat"
-MODELS_URL = "https://duckduckgo.com/duckchat/v1/models"
+BASE = "https://duck.ai"
+STATUS_URL = f"{BASE}/duckchat/v1/status"
+CHAT_URL = f"{BASE}/duckchat/v1/chat"
+MODELS_URL = f"{BASE}/duckchat/v1/models"
+AUTH_URL = f"{BASE}/duckchat/v1/auth/token"
+CAPABILITIES_URL = f"{BASE}/duckchat/v1/capabilities"
+
+FE_VERSION = "serp_20261117_201536_ET-1fa5b033293521d7ce8eee3f19c13def14a59cf5"
 
 
 class Client:
@@ -41,8 +48,7 @@ class Client:
     model: str | Model
         Default model.
     system: str | None
-        Optional system prompt applied to every request.
-        Note: Duck.ai has no system role — this is prepended into the first user message.
+        Optional system prompt (prepended into first user message).
     max_retries: int
         How many times to refresh challenge / rotate on failure.
     log_level: str
@@ -59,6 +65,8 @@ class Client:
         "_history",
         "_lock",
         "_last_refresh",
+        "_journey",
+        "_conversation_id",
     )
 
     def __init__(
@@ -66,7 +74,7 @@ class Client:
         *,
         impersonate: Optional[str] = None,
         proxy: Optional[str] = None,
-        model: Union[str, Model] = Model.GPT_4O_MINI,
+        model: Union[str, Model] = Model.GPT_6_LUNA,
         system: Optional[str] = None,
         max_retries: int = 6,
         log_level: str = "INFO",
@@ -77,15 +85,18 @@ class Client:
             impersonate=impersonate,
             proxy=proxy,
             pool=pool or IMPERSONATE_POOL,
+            origin=BASE,
         )
         self._model = str(model)
         self._system = system
         self._vqd4: Optional[str] = None
         self._hash1: Optional[str] = None
         self._max_retries = max_retries
-        self._history: List[Dict[str, str]] = []
+        self._history: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self._last_refresh = 0.0
+        self._journey = uuid.uuid4().hex
+        self._conversation_id = str(uuid.uuid4())
 
     @property
     def model(self) -> str:
@@ -104,11 +115,25 @@ class Client:
         self._system = value
 
     @property
-    def history(self) -> List[Dict[str, str]]:
+    def history(self) -> List[Dict[str, Any]]:
         return list(self._history)
 
     def clear_history(self) -> None:
         self._history.clear()
+        self._conversation_id = str(uuid.uuid4())
+
+    def new_session(self) -> None:
+        """Reset guest session (usage limit / memory boundary)."""
+        self.clear_history()
+        self._journey = uuid.uuid4().hex
+        self._hash1 = None
+        self._vqd4 = None
+        self._last_refresh = 0.0
+        log.info("guest session reset")
+
+    @staticmethod
+    def _text_content(text: str) -> List[Dict[str, str]]:
+        return [{"type": "text", "text": text}]
 
     def _build_messages(
         self,
@@ -116,22 +141,32 @@ class Client:
         *,
         history: bool,
         system: Optional[str] = None,
-    ) -> List[Dict[str, str]]:
-        """Build messages. Duck.ai only accepts user/assistant roles."""
-        messages: List[Dict[str, str]] = []
+    ) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
         if history:
             messages.extend(self._history)
 
         sys_prompt = system if system is not None else self._system
-        user_content = content
+        user_text = content
         if sys_prompt and not messages:
-            user_content = f"{sys_prompt.strip()}\n\n{content}"
+            user_text = f"{sys_prompt.strip()}\n\n{content}"
 
-        messages.append({"role": "user", "content": user_content})
+        messages.append({"role": "user", "content": self._text_content(user_text)})
         return messages
 
+    def _fe_signals(self) -> str:
+        now = int(time.time() * 1000)
+        payload = {
+            "start": now - 2000,
+            "events": [
+                {"name": "startNewChat_free", "delta": 400},
+                {"name": "action", "delta": 1200, "trusted": True},
+            ],
+            "end": 2500,
+        }
+        return b64encode(orjson.dumps(payload)).decode("ascii")
+
     async def _refresh_tokens(self, force: bool = False) -> None:
-        """Fetch status and solve challenge."""
         now = time.monotonic()
         if not force and self._hash1 and (now - self._last_refresh) < 30:
             return
@@ -145,16 +180,22 @@ class Client:
                 try:
                     resp = await self._http.get(
                         STATUS_URL,
-                        headers={"x-vqd-accept": "1", "Accept": "text/event-stream"},
+                        headers={
+                            "x-vqd-accept": "1",
+                            "Accept": "*/*",
+                            "cache-control": "no-store",
+                            "x-ddg-journey-id": self._journey,
+                        },
                     )
                     headers = dict(resp.headers)
                     solved, vqd4 = solve_from_status(
                         headers,
                         self._http.user_agent,
                         sec_ch_ua=self._http.sec_ch_ua,
+                        origin=BASE,
                     )
                     if not solved and not vqd4:
-                        raise ChallengeError("no x-vqd-hash-1 or x-vqd-4 in status response")
+                        raise ChallengeError("no x-vqd-hash-1 or x-vqd-4 in status")
 
                     if solved:
                         self._hash1 = solved
@@ -171,7 +212,7 @@ class Client:
                 except (AuthError, ChallengeError, HTTPException, RateLimitError) as e:
                     log.warning("refresh attempt {} failed: {}", attempt, e)
                     self._http.rotate()
-                    await asyncio.sleep(0.3 * attempt)
+                    await asyncio.sleep(0.4 * attempt)
                 except Exception as e:
                     log.warning("refresh unexpected: {}", e)
                     self._http.rotate()
@@ -183,6 +224,10 @@ class Client:
         h: Dict[str, str] = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
+            "x-ddg-journey-id": self._journey,
+            "x-fe-version": FE_VERSION,
+            "x-fe-signals": self._fe_signals(),
+            "x-duckai-consent-purposes": "user-location,image-generation,web-search",
         }
         if self._hash1:
             h["x-vqd-hash-1"] = self._hash1
@@ -195,7 +240,6 @@ class Client:
             await self._refresh_tokens(force=True)
 
     async def models(self) -> List[ModelInfo]:
-        """Return the list of currently available models."""
         await self._ensure_ready()
         resp = await self._http.get(MODELS_URL, headers=self._chat_headers())
         data = orjson.loads(resp.content)
@@ -226,7 +270,13 @@ class Client:
         model_s = str(model or self._model)
 
         messages = self._build_messages(content, history=history, system=system)
-        body = {"model": model_s, "messages": messages}
+        body: Dict[str, Any] = {
+            "model": model_s,
+            "messages": messages,
+            "canUseTools": True,
+            "reasoningEffort": "none",
+            "canShowGreeting": False,
+        }
 
         last_err: Optional[Exception] = None
         for attempt in range(1, self._max_retries + 1):
@@ -241,9 +291,21 @@ class Client:
                     self._vqd4 = new_vqd
 
                 text = self._parse_sse(resp.content)
+
+                # usage / guest limit signals in SSE
+                if "ERR_USAGE" in (resp.content.decode("utf-8", errors="ignore")):
+                    log.warning("usage limit hit — resetting guest session")
+                    self.new_session()
+                    await self._refresh_tokens(force=True)
+                    continue
+
                 if history:
-                    self._history.append({"role": "user", "content": content})
-                    self._history.append({"role": "assistant", "content": text})
+                    self._history.append(
+                        {"role": "user", "content": self._text_content(content)}
+                    )
+                    self._history.append(
+                        {"role": "assistant", "content": self._text_content(text)}
+                    )
 
                 return ChatResult(
                     content=text,
@@ -263,8 +325,7 @@ class Client:
             except HTTPException as e:
                 last_err = e
                 log.warning("http error attempt {}: {}", attempt, e)
-                # 400 often means bad hash or bad body — force refresh
-                if getattr(e, "status", None) == 400:
+                if getattr(e, "status", None) in (400, 418):
                     await self._refresh_tokens(force=True)
                 self._http.rotate()
                 await asyncio.sleep(0.4 * attempt)
@@ -284,7 +345,13 @@ class Client:
         model_s = str(model or self._model)
 
         messages = self._build_messages(content, history=history, system=system)
-        body = {"model": model_s, "messages": messages}
+        body: Dict[str, Any] = {
+            "model": model_s,
+            "messages": messages,
+            "canUseTools": True,
+            "reasoningEffort": "none",
+            "canShowGreeting": False,
+        }
 
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -304,8 +371,15 @@ class Client:
                     yield chunk
 
                 if history and full:
-                    self._history.append({"role": "user", "content": content})
-                    self._history.append({"role": "assistant", "content": "".join(full)})
+                    self._history.append(
+                        {"role": "user", "content": self._text_content(content)}
+                    )
+                    self._history.append(
+                        {
+                            "role": "assistant",
+                            "content": self._text_content("".join(full)),
+                        }
+                    )
                 return
             except AuthError:
                 log.warning("stream auth fail — refresh")
@@ -333,9 +407,22 @@ class Client:
             try:
                 obj = orjson.loads(data)
                 if isinstance(obj, dict):
+                    if obj.get("action") == "error":
+                        raise HTTPException(
+                            f"SSE error: {obj.get('type') or obj}",
+                            status=int(obj.get("status") or 400),
+                            payload=str(obj),
+                        )
                     msg = obj.get("message") or obj.get("content") or ""
+                    if isinstance(msg, list):
+                        msg = "".join(
+                            b.get("text", "") if isinstance(b, dict) else str(b)
+                            for b in msg
+                        )
                     if msg:
                         parts.append(str(msg))
+            except HTTPException:
+                raise
             except Exception:
                 if data and not data.startswith("{"):
                     parts.append(data)
@@ -356,8 +443,17 @@ class Client:
                 obj = orjson.loads(data)
                 msg = ""
                 if isinstance(obj, dict):
-                    msg = str(obj.get("message") or obj.get("content") or "")
-                yield StreamChunk(content=msg, model=self._model, vqd=self._vqd4, raw=obj)
+                    raw_msg = obj.get("message") or obj.get("content") or ""
+                    if isinstance(raw_msg, list):
+                        msg = "".join(
+                            b.get("text", "") if isinstance(b, dict) else str(b)
+                            for b in raw_msg
+                        )
+                    else:
+                        msg = str(raw_msg)
+                yield StreamChunk(
+                    content=msg, model=self._model, vqd=self._vqd4, raw=obj
+                )
             except Exception:
                 yield StreamChunk(content=data, vqd=self._vqd4)
 
