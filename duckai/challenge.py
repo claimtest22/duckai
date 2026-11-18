@@ -1,71 +1,42 @@
 """
-Pure-Python VQD hash challenge solver.
+VQD hash challenge solver.
 
-Verified against live captures:
-  client_hashes[0] = SHA256(user_agent)
-  client_hashes[1] = SHA256(dom_score_a)   # e.g. "8471"
-  client_hashes[2] = SHA256(dom_score_b)   # e.g. "6878"
-
-Scores are derived from the challenge script constants + a fixed
-layout mannequin (offset 24/24) so we never claim webdriver/Selenium.
+Primary path: Node.js + jsdom (ships solver.js) — executes the real challenge.
+Fallback: pure-Python static approximation (often 418 on current PoW).
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from base64 import b64decode, b64encode
-from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import orjson
 
 from .logging import log
 
+_SOLVER_JS = Path(__file__).resolve().parent / "solver.js"
+
 
 def _sha256_b64(data: str) -> str:
-    return b64encode(hashlib.sha256(str(data).encode("utf-8")).digest()).decode("ascii")
-
-
-def _parse_string_table(script: str) -> List[str]:
-    m = re.search(
-        r"function\s+_0x[a-f0-9]+\(\)\s*\{\s*const\s+_0x[a-f0-9]+=(\[[\s\S]*?\]);",
-        script,
+    return b64encode(hashlib.sha256(str(data).encode("utf-8")).digest()).decode(
+        "ascii"
     )
-    if not m:
-        return []
-    try:
-        return list(eval(m.group(1)))  # noqa: S307 — controlled challenge source
-    except Exception:
-        return []
 
 
 def _parse_server_hashes(script: str) -> List[str]:
     found: List[str] = []
     ret = script[script.rfind("return{") :] if "return{" in script else script
-
     for h in re.findall(r"'([A-Za-z0-9+/]{40,60}={0,2})'", ret):
         if len(h) >= 40 and h not in found:
             found.append(h)
-
-    # Resolve string-table lookups in the return payload
-    table = _parse_string_table(script)
-    if table:
-        om = re.search(r"_0x[a-f0-9]+=_0x[a-f0-9]+-(0x[0-9a-f]+)", script)
-        offset = int(om.group(1), 16) if om else 0
-        for m in re.finditer(r"_0x[a-f0-9]+\((0x[0-9a-f]+)\)", ret):
-            idx = int(m.group(1), 16) - offset
-            if 0 <= idx < len(table):
-                val = table[idx]
-                if (
-                    isinstance(val, str)
-                    and len(val) >= 40
-                    and re.match(r"^[A-Za-z0-9+/]+={0,2}$", val)
-                    and val not in found
-                ):
-                    found.append(val)
-
     if len(found) < 2:
         for m in re.finditer(r"[A-Za-z0-9+/]{43,60}={0,2}", script):
             h = m.group(0)
@@ -73,7 +44,6 @@ def _parse_server_hashes(script: str) -> List[str]:
                 found.append(h)
             if len(found) >= 3:
                 break
-
     return found[:3]
 
 
@@ -88,66 +58,84 @@ def _parse_meta(script: str) -> Dict[str, str]:
     m = re.search(r"'challenge_id':'([^']+)'", script)
     if m:
         meta["challenge_id"] = m.group(1)
-    else:
-        table = _parse_string_table(script)
-        for s in table:
-            if isinstance(s, str) and len(s) >= 40 and re.match(r"^[0-9a-f]+", s):
-                meta["challenge_id"] = s
-                break
     m = re.search(r"'timestamp':'([^']+)'", script)
     if m:
         meta["timestamp"] = m.group(1)
     else:
-        table = _parse_string_table(script)
-        for s in table:
-            if isinstance(s, str) and s.isdigit() and len(s) >= 13:
-                meta["timestamp"] = s
-                break
-        else:
-            meta["timestamp"] = str(int(time.time() * 1000))
+        meta["timestamp"] = str(int(time.time() * 1000))
     return meta
 
 
-def _layout_scores(script: str) -> Tuple[str, str]:
-    """Derive the two DOM mannequin scores embedded in the challenge.
+def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
+    """Execute challenge via Node + jsdom (solver.js)."""
+    if not shutil.which("node"):
+        log.debug("node not on PATH")
+        return None
+    if not _SOLVER_JS.is_file():
+        log.debug("solver.js missing at {}", _SOLVER_JS)
+        return None
 
-    Live captures used "8471" and "6878". Those come from
-    String(BASE + layout) style reductions. We recover candidate
-    bases from the script and apply the fixed mannequin layout (48).
-    """
-    bases: List[int] = []
-    for m in re.finditer(r"0x([0-9a-fA-F]+)", script):
+    try:
+        script = b64decode(challenge_b64)
+    except Exception:
+        return None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".js", delete=False) as tmp:
+            tmp.write(script)
+            tmp_path = tmp.name
         try:
-            v = int(m.group(1), 16)
-            if 200 <= v <= 30000:
-                bases.append(v)
-        except ValueError:
-            pass
-    for m in re.finditer(r"[^a-fA-F0-9]([1-9][0-9]{3,4})[^a-fA-F0-9]", script):
-        try:
-            v = int(m.group(1))
-            if 200 <= v <= 30000:
-                bases.append(v)
-        except ValueError:
-            pass
+            proc = subprocess.run(
+                ["node", str(_SOLVER_JS), tmp_path, user_agent],
+                capture_output=True,
+                timeout=12,
+                check=False,
+            )
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
-    layout = 48  # 24+24 mannequin
-    scores: List[str] = []
-    if bases:
-        common = [b for b, _ in Counter(bases).most_common(12)]
-        for b in common:
-            scores.append(str(b + layout))
-            scores.append(str(b))
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:300]
+            log.debug("node solver rc={} err={}", proc.returncode, err)
+            return None
 
-    # Fallbacks proven against a real browser-solved token
-    if "8471" not in scores:
-        scores.append("8471")
-    if "6878" not in scores:
-        scores.append("6878")
+        raw = proc.stdout.decode("utf-8", "replace").strip()
+        result = json.loads(raw)
+        if result.get("__error"):
+            log.debug("node solver error: {}", result["__error"][:200])
+            return None
+        if not isinstance(result.get("client_hashes"), list):
+            log.debug("node solver bad shape")
+            return None
 
-    a = scores[0] if scores else "8471"
-    b = scores[1] if len(scores) > 1 else "6878"
-    return a, b
+        hashed = [_sha256_b64(x) for x in result["client_hashes"]]
+        meta = dict(result.get("meta") or {})
+        meta.setdefault("origin", "https://duck.ai")
+        meta.setdefault("stack", "Error\n    at solve (native)")
+        meta.setdefault("duration", "15")
+
+        payload: Dict[str, Any] = {
+            "server_hashes": result.get("server_hashes") or [],
+            "client_hashes": hashed,
+            "signals": result.get("signals") or {},
+            "meta": meta,
+        }
+        solved = b64encode(orjson.dumps(payload)).decode("ascii")
+        log.debug(
+            "node pow ok  raw={}  servers={}  len={}",
+            result["client_hashes"][1:3] if len(result["client_hashes"]) > 1 else [],
+            len(payload["server_hashes"]),
+            len(solved),
+        )
+        return solved
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.debug("node solver exception: {}", e)
+        return None
 
 
 def solve_static(
@@ -157,6 +145,7 @@ def solve_static(
     sec_ch_ua: str = "",
     origin: str = "https://duck.ai",
 ) -> str:
+    """Best-effort pure Python (often rejected by current PoW)."""
     try:
         script = b64decode(challenge_b64).decode("utf-8", errors="replace")
     except Exception:
@@ -166,13 +155,11 @@ def solve_static(
     meta = _parse_meta(script)
     meta["origin"] = origin
 
-    score_a, score_b = _layout_scores(script)
-
-    # Order verified against browser-captured solved tokens
+    # Verified shape: [UA, score_a, score_b] then SHA-256 each
     client_hashes = [
         _sha256_b64(user_agent),
-        _sha256_b64(score_a),
-        _sha256_b64(score_b),
+        _sha256_b64("2733"),
+        _sha256_b64("4169"),
     ]
 
     payload: Dict[str, Any] = {
@@ -181,17 +168,7 @@ def solve_static(
         "signals": {},
         "meta": meta,
     }
-
-    solved = b64encode(orjson.dumps(payload)).decode("ascii")
-    log.debug(
-        "pow solved  servers={}  scores={},{}  ua_hash={}  len={}",
-        len(server_hashes),
-        score_a,
-        score_b,
-        client_hashes[0][:16],
-        len(solved),
-    )
-    return solved
+    return b64encode(orjson.dumps(payload)).decode("ascii")
 
 
 def solve_from_status(
@@ -200,7 +177,7 @@ def solve_from_status(
     *,
     sec_ch_ua: str = "",
     origin: str = "https://duck.ai",
-    prefer_node: bool = False,
+    prefer_node: bool = True,
 ) -> Tuple[Optional[str], Optional[str]]:
     h = {k.lower(): v for k, v in headers.items()}
     challenge = h.get("x-vqd-hash-1")
@@ -209,9 +186,14 @@ def solve_from_status(
     if not challenge:
         return None, vqd4
 
-    return solve_static(
-        challenge,
-        user_agent,
-        sec_ch_ua=sec_ch_ua,
-        origin=origin,
-    ), vqd4
+    if prefer_node:
+        solved = solve_with_node(challenge, user_agent)
+        if solved:
+            return solved, vqd4
+
+    return (
+        solve_static(
+            challenge, user_agent, sec_ch_ua=sec_ch_ua, origin=origin
+        ),
+        vqd4,
+    )

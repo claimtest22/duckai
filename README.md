@@ -10,6 +10,17 @@ Made by **frat**.
 pip install -U ddgai
 ```
 
+**PoW solver (required for reliable chat):**
+
+```bash
+# Node 18+ and jsdom
+npm install -g jsdom
+# or in project: npm install jsdom
+```
+
+The library shells out to `node duckai/solver.js` to execute the live
+`x-vqd-hash-1` challenge. Pure-Python fallback exists but usually gets 418.
+
 ## Quick start
 
 ```python
@@ -17,7 +28,7 @@ import asyncio
 from duckai import Client, Model
 
 async def main():
-    async with Client(model=Model.GPT_6_LUNA) as client:
+    async with Client(model=Model.GPT_6_LUNA, log_level="DEBUG") as client:
         r = await client.chat("say hi")
         print(r.content)
 
@@ -27,50 +38,34 @@ asyncio.run(main())
 ## Streaming
 
 ```python
-async with Client() as client:
+async with Client(impersonate="chrome131_android") as client:
     async for chunk in client.stream("explain async in one sentence"):
         if chunk.content:
             print(chunk.content, end="", flush=True)
 ```
 
-## System prompts
+## Android / Acode
 
-Duck.ai has no `system` role. Prompts are prepended into the first user message.
+1. Install Node (Termux: `pkg install nodejs`)
+2. `npm install -g jsdom`
+3. `pip install -U ddgai`
+4. Run as usual — solver uses Node automatically
 
-```python
-async with Client(system="Answer in 3 words max.") as client:
-    print((await client.chat("What is Python?")).content)
-```
+## Manual hash (no Node)
 
-## Usage limit / guest reset
-
-When free-tier usage is exhausted the client resets the guest session automatically.
-You can also force it:
-
-```python
-client.reset_session()
-```
-
-## Challenge / 418 ERR_CHALLENGE
-
-The live `x-vqd-hash-1` PoW needs real DOM metrics. Pure-Python is best-effort.
-
-**Most reliable:** capture a solved hash from your browser (Network tab → chat request → `x-vqd-hash-1`) and pass it in:
+Capture `x-vqd-hash-1` from browser Network tab on a successful chat:
 
 ```python
 async with Client(solved_hash="eyJ...") as client:
     print((await client.chat("hi")).content)
 ```
 
-Optional Node.js fallback is used automatically when `node` is on PATH.
-
-Acode does **not** run browser JS for this. Termux + Node can.
-
 ## Notes
 
 - Host: `https://duck.ai`
-- Message content is typed blocks: `{"type":"text","text":"..."}`
+- Message content blocks: `[{"type":"text","text":"..."}]`
 - Default model: `gpt-6-luna`
+- Datacenter IPs may get `ERR_BN_LIMIT` even with a valid PoW — use residential
 
 ## License
 
