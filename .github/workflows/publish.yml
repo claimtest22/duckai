@@ -9,7 +9,6 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
 
     steps:
@@ -20,6 +19,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Check PyPI token
+        env:
+          PYPI_TOKEN: ${{ secrets.pypi || secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_TOKEN" ]; then
+            echo "::error::No PyPI token found. Add a repository secret named 'pypi' (or 'PYPI_API_TOKEN') with your PyPI API token."
+            exit 1
+          fi
+          echo "PyPI token is present"
 
       - name: Install build tools
         run: |
@@ -32,6 +41,6 @@ jobs:
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.pypi }}
+          TWINE_PASSWORD: ${{ secrets.pypi || secrets.PYPI_API_TOKEN }}
         run: |
           twine upload --skip-existing dist/*
