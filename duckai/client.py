@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from base64 import b64encode
+from base64 import b64encode, urlsafe_b64encode
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Union
 
 import orjson
@@ -31,8 +31,54 @@ BASE = "https://duck.ai"
 STATUS_URL = f"{BASE}/duckchat/v1/status"
 CHAT_URL = f"{BASE}/duckchat/v1/chat"
 MODELS_URL = f"{BASE}/duckchat/v1/models"
+CAPABILITIES_URL = f"{BASE}/duckchat/v1/capabilities"
+AUTH_TOKEN_URL = f"{BASE}/duckchat/v1/auth/token"
+COUNTRY_URL = f"{BASE}/country.json"
 
-FE_VERSION = "serp_20261119_094842_ET-356c340559fb888396c231b2c9c56b2402cefab9"
+
+def _b64url_int(n: int) -> str:
+    length = (n.bit_length() + 7) // 8
+    return urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode("ascii")
+
+
+def make_durable_stream() -> Dict[str, Any]:
+    """RSA-OAEP-256 public JWK envelope the frontend always sends."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+
+        priv = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048, backend=default_backend()
+        )
+        nums = priv.public_key().public_numbers()
+        jwk = {
+            "kty": "RSA",
+            "alg": "RSA-OAEP-256",
+            "e": _b64url_int(nums.e),
+            "n": _b64url_int(nums.n),
+            "use": "enc",
+            "ext": True,
+            "key_ops": ["encrypt"],
+        }
+    except Exception:
+        # Static fallback JWK (same shape the FE uses when subtle is unavailable)
+        jwk = {
+            "kty": "RSA",
+            "alg": "RSA-OAEP-256",
+            "e": "AQAB",
+            "n": (
+                "sXinxGRxiKAwvP8f5kT0nq0vL1Z8y9c0hQ3p2mN4oP5qR6sT7uV8wX9yZ0aB1cD2eF3gH4iJ5kL"
+                "6mN7oP8qR9sT0uV1wX2yZ3aB4cD5eF6gH7iJ8kL9mN0oP1qR2sT3uV4wX5yZ6aB7cD8eF9gH0iJ"
+                "1kL2mN3oP4qR5sT6uV7wX8yZ9aB0cD1eF2gH3iJ4kL5mN6oP7qR8sT9uV0wX1yZ2aB3cD4eF5gH"
+            ),
+            "use": "enc",
+            "ext": True,
+            "key_ops": ["encrypt"],
+        }
+    return {
+        "messageId": str(uuid.uuid4()),
+        "publicKeyJwk": jwk,
+    }
 
 
 class Client:
@@ -51,12 +97,14 @@ class Client:
         "_solved_hash",
         "_conversation_id",
         "_journey_id",
+        "_fe_version",
+        "_warmed",
     )
 
     def __init__(
         self,
         *,
-        impersonate: Optional[str] = "chrome131",
+        impersonate: Optional[str] = "chrome131_android",
         proxy: Optional[str] = None,
         model: Union[str, Model] = Model.GPT_6_LUNA,
         system: Optional[str] = None,
@@ -67,9 +115,15 @@ class Client:
         user_agent: Optional[str] = None,
     ) -> None:
         setup_logging(log_level)
-        pool = list(pool) if pool else ["chrome131", "chrome124", "chrome131_android"]
+        # Prefer Android profiles first — matches real phone traffic & reduces BN_LIMIT
+        pool = list(pool) if pool else [
+            "chrome131_android",
+            "chrome131",
+            "chrome124",
+            "chrome99_android",
+        ]
         self._http = HTTPClient(
-            impersonate=impersonate or "chrome131",
+            impersonate=impersonate or "chrome131_android",
             proxy=proxy,
             pool=pool,
             user_agent=user_agent,
@@ -85,6 +139,8 @@ class Client:
         self._last_refresh = 0.0
         self._conversation_id = str(uuid.uuid4())
         self._journey_id = uuid.uuid4().hex
+        self._fe_version: Optional[str] = None
+        self._warmed = False
 
     @property
     def model(self) -> str:
@@ -106,6 +162,7 @@ class Client:
         self._hash1 = self._solved_hash
         self._vqd4 = None
         self._last_refresh = 0.0
+        self._warmed = False
         self.clear_history()
         self._journey_id = uuid.uuid4().hex
 
@@ -137,20 +194,39 @@ class Client:
     def _fe_signals(self) -> str:
         now = int(time.time() * 1000)
         payload = {
-            "start": now - 2000,
+            "start": now - 2500,
             "events": [
-                {"name": "startNewChat_free", "delta": 400},
-                {"name": "action", "delta": 1200, "trusted": True},
+                {"name": "onboarding_impression", "delta": 220},
+                {"name": "onboarding_finish", "delta": 1800},
+                {"name": "startNewChat_free", "delta": 2100},
+                {"name": "action", "delta": 2300, "trusted": True},
             ],
-            "end": 2500,
+            "end": 2400,
         }
         return b64encode(orjson.dumps(payload)).decode("ascii")
 
     async def _warmup(self) -> None:
+        """Mirror real browser boot: home + capabilities + auth/token + country."""
+        if self._warmed and self._fe_version:
+            return
         try:
-            await self._http.get(BASE + "/")
+            home = await self._http.get(BASE + "/")
+            text = home.text if hasattr(home, "text") else home.content.decode("utf-8", "replace")
+            import re
+            tag = re.search(r'data-version-tag="([^"]+)"', text)
+            sha = re.search(r'data-version-sha="([^"]+)"', text)
+            if tag and sha:
+                self._fe_version = f"{tag.group(1)}-{sha.group(1)}"
+                log.debug("fe_version={}", self._fe_version)
         except Exception as exc:
-            log.debug("warmup failed: {}", exc)
+            log.debug("home warmup failed: {}", exc)
+
+        for url in (CAPABILITIES_URL, AUTH_TOKEN_URL, COUNTRY_URL):
+            try:
+                await self._http.get(url)
+            except Exception:
+                pass
+        self._warmed = True
 
     async def _refresh_tokens(self, force: bool = False) -> None:
         if self._solved_hash and not force:
@@ -198,6 +274,9 @@ class Client:
                         len(self._hash1 or ""),
                     )
                     return
+                except BanLimitError as e:
+                    log.warning("refresh BN_LIMIT attempt {}", attempt)
+                    await asyncio.sleep(3.0 * attempt)
                 except RateLimitError as e:
                     log.warning("refresh rate limited attempt {}", attempt)
                     await asyncio.sleep(1.5 * attempt)
@@ -217,9 +296,13 @@ class Client:
         h: Dict[str, str] = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "x-fe-version": FE_VERSION,
+            "x-fe-version": self._fe_version or "",
             "x-fe-signals": self._fe_signals(),
             "x-ddg-journey-id": self._journey_id,
+            "x-duckai-response-id": str(uuid.uuid4()),
+            "x-duckai-tool-approval": "web-search",
+            "x-duckai-consent-purposes": "user-location,image-generation,web-search",
+            "priority": "u=1, i",
         }
         if self._hash1:
             h["x-vqd-hash-1"] = self._hash1
@@ -232,17 +315,30 @@ class Client:
         messages: List[Dict[str, Any]],
         model: str,
     ) -> Dict[str, Any]:
+        # Matches current duck.ai frontend shape (metadata + durableStream required)
         return {
             "model": model,
+            "metadata": {
+                "toolChoice": {
+                    "GenerateImage": False,
+                    "WebSearch": False,
+                    "NewsSearch": False,
+                    "VideosSearch": False,
+                    "LocalSearch": False,
+                    "WeatherForecast": False,
+                },
+            },
             "messages": messages,
             "canUseTools": True,
             "reasoningEffort": "none",
             "canUseApproxLocation": None,
             "canDelegateImageGeneration": None,
             "canShowGreeting": False,
+            "durableStream": make_durable_stream(),
         }
 
     async def _ensure_ready(self) -> None:
+        await self._warmup()
         if not self._hash1 and not self._vqd4:
             await self._refresh_tokens(force=True)
 
@@ -282,8 +378,14 @@ class Client:
                 return ChatResult(content=text, model=model_s, vqd=self._vqd4)
             except BanLimitError as e:
                 last_err = e
-                log.warning("BN_LIMIT attempt {} — backing off", attempt)
-                await asyncio.sleep(8.0 * attempt)
+                log.warning(
+                    "BN_LIMIT attempt {} — IP/entrypoint blocked (not challenge). "
+                    "Real browser works on residential IPs; curl from banned/datacenter IPs gets this.",
+                    attempt,
+                )
+                if attempt >= 2:
+                    break
+                await asyncio.sleep(5.0 * attempt)
             except AuthError as e:
                 last_err = e
                 log.warning("chat auth fail attempt {} — refreshing", attempt)
@@ -346,6 +448,11 @@ class Client:
                         }
                     )
                 return
+            except BanLimitError as e:
+                log.warning("stream BN_LIMIT attempt {}", attempt)
+                if attempt >= 2:
+                    break
+                await asyncio.sleep(5.0 * attempt)
             except AuthError:
                 log.warning("stream auth fail — refresh")
                 self._hash1 = None
