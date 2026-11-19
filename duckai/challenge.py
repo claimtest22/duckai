@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import subprocess
@@ -17,7 +16,13 @@ _SOLVER_JS = Path(__file__).resolve().parent / "solver.js"
 _NODE = shutil.which("node") or shutil.which("nodejs")
 
 
-def _solve_sync(challenge_b64: str, user_agent: str) -> str:
+def solve_static(
+    challenge_b64: str,
+    user_agent: str,
+    *,
+    origin: str = "https://duck.ai",
+    sec_ch_ua: Optional[str] = None,
+) -> str:
     if not _NODE:
         raise RuntimeError("node binary not found — install node to solve duck.ai challenges")
     if not _SOLVER_JS.is_file():
@@ -48,19 +53,22 @@ def _solve_sync(challenge_b64: str, user_agent: str) -> str:
     return str(data["hash"])
 
 
-async def solve_static(challenge_b64: str, user_agent: str, **_: object) -> str:
-    return await asyncio.to_thread(_solve_sync, challenge_b64, user_agent)
-
-
-async def solve_from_status(
+def solve_from_status(
     headers: Dict[str, str],
     user_agent: str,
-    **_: object,
+    *,
+    origin: str = "https://duck.ai",
+    sec_ch_ua: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     h = {k.lower(): v for k, v in headers.items()}
     challenge = h.get("x-vqd-hash-1")
     vqd4 = h.get("x-vqd-4")
     if not challenge:
         return None, vqd4
-    solved = await solve_static(challenge, user_agent)
+    solved = solve_static(
+        challenge,
+        user_agent,
+        origin=origin,
+        sec_ch_ua=sec_ch_ua,
+    )
     return solved, vqd4
