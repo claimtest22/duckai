@@ -61,7 +61,7 @@ class Client:
         system: Optional[str] = None,
         max_retries: int = 4,
         log_level: str = "INFO",
-        pool: Optional[Sequence[str] ] = None,
+        pool: Optional[Sequence[str]] = None,
         solved_hash: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> None:
