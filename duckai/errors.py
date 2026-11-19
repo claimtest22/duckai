@@ -1,6 +1,4 @@
-"""
-Error hierarchy for duckai.
-"""
+"""Error hierarchy for duckai."""
 
 from typing import Any, Optional
 
@@ -23,8 +21,12 @@ class RateLimitError(DuckAIException):
     """Raised on HTTP 429."""
 
 
+class BanLimitError(DuckAIException):
+    """Raised on ERR_BN_LIMIT (IP / entrypoint reputation block)."""
+
+
 class AuthError(DuckAIException):
-    """Raised on missing or invalid VQD tokens (418 / no hash)."""
+    """Raised on missing or invalid VQD tokens (418 challenge)."""
 
 
 class HTTPException(DuckAIException):
