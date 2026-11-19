@@ -1,221 +1,83 @@
 """
 VQD hash challenge solver.
 
-Primary path: Node.js + jsdom (ships solver.js) — executes the real challenge.
-Fallback: pure-Python static approximation (often 418 on current PoW).
+Runs the obfuscated duck.ai challenge script inside a Node.js vm sandbox
+and returns the base64 payload for the x-vqd-hash-1 header.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
+import asyncio
 import os
-import re
 import shutil
 import subprocess
-import tempfile
-import time
-from base64 import b64decode, b64encode
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
+
+import orjson
 
 from .logging import log
 
-_SOLVER_JS = Path(__file__).resolve().parent / "solver.js"
+
+_SOLVER_JS = Path(__file__).resolve().parent / 'solver.js'
+_NODE = shutil.which('node') or shutil.which('nodejs')
 
 
-def _sha256_b64(data: str) -> str:
-    return b64encode(hashlib.sha256(str(data).encode("utf-8")).digest()).decode(
-        "ascii"
-    )
-
-
-def _node_env() -> Dict[str, str]:
-    env = dict(os.environ)
-    roots: List[str] = []
-    try:
-        root = subprocess.check_output(
-            ["npm", "root", "-g"],
-            text=True,
-            timeout=5,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        if root:
-            roots.append(root)
-    except Exception:
-        pass
-    for guess in (
-        "/usr/local/lib/node_modules",
-        "/usr/lib/node_modules",
-        str(Path.home() / ".npm-global" / "lib" / "node_modules"),
-    ):
-        if guess not in roots and Path(guess).is_dir():
-            roots.append(guess)
-    existing = env.get("NODE_PATH", "")
-    if existing:
-        roots.append(existing)
-    if roots:
-        env["NODE_PATH"] = os.pathsep.join(roots)
-    return env
-
-
-def _parse_server_hashes(script: str) -> List[str]:
-    found: List[str] = []
-    ret = script[script.rfind("return{") :] if "return{" in script else script
-    for h in re.findall(r"'([A-Za-z0-9+/]{40,60}={0,2})'", ret):
-        if len(h) >= 40 and h not in found:
-            found.append(h)
-    if len(found) < 2:
-        for m in re.finditer(r"[A-Za-z0-9+/]{43,60}={0,2}", script):
-            h = m.group(0)
-            if h not in found:
-                found.append(h)
-            if len(found) >= 3:
-                break
-    return found[:3]
-
-
-def _parse_meta(script: str) -> Dict[str, str]:
-    meta: Dict[str, str] = {
-        "v": "4",
-        "origin": "https://duck.ai",
-        "debug": "HJ",
-        "duration": "80",
-        "stack": "Error\n    at solve (native)",
-    }
-    m = re.search(r"'challenge_id':'([^']+)'", script)
-    if m:
-        meta["challenge_id"] = m.group(1)
-    m = re.search(r"'timestamp':'([^']+)'", script)
-    if m:
-        meta["timestamp"] = m.group(1)
-    else:
-        meta["timestamp"] = str(int(time.time() * 1000))
-    return meta
-
-
-def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
-    """Execute challenge via Node + jsdom (solver.js)."""
-    if not shutil.which("node"):
-        log.debug("node not on PATH")
-        return None
+def _solve_sync(challenge_b64: str, user_agent: str) -> str:
+    if not _NODE:
+        raise RuntimeError('node binary not found \u2014 install node to solve duck.ai challenges')
     if not _SOLVER_JS.is_file():
-        log.debug("solver.js missing at {}", _SOLVER_JS)
-        return None
+        raise RuntimeError(f'solver.js missing at {_SOLVER_JS}')
+
+    payload = orjson.dumps({'challenge': challenge_b64, 'user_agent': user_agent})
+    env = dict(os.environ)
+    proc = subprocess.run(
+        [_NODE, str(_SOLVER_JS)],
+        input=payload,
+        capture_output=True,
+        timeout=12,
+        env=env,
+    )
+    out = proc.stdout or b''
+    err = (proc.stderr or b'').decode('utf-8', errors='replace').strip()
+    if proc.returncode != 0 and not out:
+        raise RuntimeError(f'node solver failed rc={proc.returncode} err={err[:300]}')
 
     try:
-        script = b64decode(challenge_b64)
-    except Exception:
-        return None
+        data = orjson.loads(out)
+    except Exception as exc:
+        raise RuntimeError(f'node solver bad json: {out[:200]!r} err={err[:200]}') from exc
 
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".js", delete=False) as tmp:
-            tmp.write(script)
-            tmp_path = tmp.name
-        try:
-            proc = subprocess.run(
-                ["node", str(_SOLVER_JS), tmp_path, user_agent],
-                capture_output=True,
-                timeout=35,
-                check=False,
-                env=_node_env(),
-            )
-        finally:
-            try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+    if not data.get('ok') or not data.get('hash'):
+        raise RuntimeError(f'node solver error: {data.get("error") or err or "unknown"}')
 
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:400]
-            log.debug("node solver rc={} err={}", proc.returncode, err)
-            return None
-
-        raw = proc.stdout.decode("utf-8", "replace").strip()
-        result = json.loads(raw)
-        if result.get("__error"):
-            log.debug("node solver error: {}", str(result["__error"])[:200])
-            return None
-
-        solved = result.get("solved")
-        if not solved:
-            log.debug("node solver missing solved")
-            return None
-
-        log.debug(
-            "node pow ok  raw={}  servers={}  len={}",
-            (result.get("raw_client") or [])[1:3],
-            len(result.get("server_hashes") or []),
-            len(solved),
-        )
-        return solved
-    except FileNotFoundError:
-        return None
-    except subprocess.TimeoutExpired:
-        log.debug("node solver timed out")
-        return None
-    except Exception as e:
-        log.debug("node solver exception: {}", e)
-        return None
+    return str(data['hash'])
 
 
-def solve_static(
+async def solve_static(
     challenge_b64: str,
     user_agent: str,
     *,
-    sec_ch_ua: str = "",
-    origin: str = "https://duck.ai",
+    origin: str = 'https://duck.ai',
 ) -> str:
-    """Best-effort pure Python (often rejected by current PoW)."""
-    try:
-        script = b64decode(challenge_b64).decode("utf-8", errors="replace")
-    except Exception:
-        script = ""
-
-    server_hashes = _parse_server_hashes(script)
-    meta = _parse_meta(script)
-    meta["origin"] = origin
-
-    client_hashes = [
-        _sha256_b64(user_agent),
-        _sha256_b64("2733"),
-        _sha256_b64("4169"),
-    ]
-
-    payload: Dict[str, Any] = {
-        "server_hashes": server_hashes,
-        "client_hashes": client_hashes,
-        "signals": {},
-        "meta": meta,
-    }
-    return b64encode(
-        json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    ).decode("ascii")
+    """Solve the x-vqd-hash-1 challenge via Node vm."""
+    loop = asyncio.get_running_loop()
+    solved = await loop.run_in_executor(None, _solve_sync, challenge_b64, user_agent)
+    log.debug('challenge solved len={} origin={}', len(solved), origin)
+    return solved
 
 
-def solve_from_status(
+async def solve_from_status(
     headers: Dict[str, str],
     user_agent: str,
     *,
-    sec_ch_ua: str = "",
-    origin: str = "https://duck.ai",
-    prefer_node: bool = True,
+    origin: str = 'https://duck.ai',
 ) -> Tuple[Optional[str], Optional[str]]:
+    """Extract challenge + vqd-4 from status headers and solve."""
     h = {k.lower(): v for k, v in headers.items()}
-    challenge = h.get("x-vqd-hash-1")
-    vqd4 = h.get("x-vqd-4")
-
+    challenge = h.get('x-vqd-hash-1')
+    vqd4 = h.get('x-vqd-4')
     if not challenge:
         return None, vqd4
-
-    if prefer_node:
-        solved = solve_with_node(challenge, user_agent)
-        if solved:
-            return solved, vqd4
-
-    return (
-        solve_static(
-            challenge, user_agent, sec_ch_ua=sec_ch_ua, origin=origin
-        ),
-        vqd4,
-    )
+    solved = await solve_static(challenge, user_agent, origin=origin)
+    return solved, vqd4
