@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ddgai"
-version = "1.5.4"
+version = "1.6.0"
 description = "High-performance reverse-engineered Duck.ai (DuckDuckGo AI Chat) client"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "frat"}
 ]
-keywords = ["ddgai", "duck.ai", "duckduckgo", "ai", "chat", "llm"]
+keywords = ["ddgai", "duckai", "duck.ai", "duckduckgo", "ai", "chat", "llm"]
 dependencies = [
     "curl_cffi>=0.7.0",
     "orjson>=3.9.0",

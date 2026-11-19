@@ -1,6 +1,7 @@
 """
 Duck.ai (DuckDuckGo AI Chat) reverse-engineered client.
 
+Package: ddgai
 Made by frat.
 """
 
@@ -9,7 +10,7 @@ from .errors import *
 from .models import *
 from .enums import Model
 
-__version__ = "1.5.4"
+__version__ = "1.6.0"
 __author__ = "frat"
 
 __all__ = (
