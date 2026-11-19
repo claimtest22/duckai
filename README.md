@@ -1,4 +1,4 @@
-# duckchat
+# ddgai
 
 High-performance reverse-engineered **Duck.ai** client.
 
@@ -22,7 +22,7 @@ Made by **frat**.
 ## Install
 
 ```bash
-pip install duckchat
+pip install ddgai
 ```
 
 ## Quick start
@@ -49,11 +49,6 @@ async with Client() as client:
 ```
 
 ## Models
-
-```python
-models = await client.models()
-print([m.model or m.raw.get("id") for m in models])
-```
 
 Common free ids: `gpt-6-luna`, `gpt-5.4-mini`, `mistral-small-2603`, `tinfoil/gemma4-31b`.
 
