@@ -23,7 +23,7 @@ from .errors import (
 )
 from .http import HTTPClient, IMPERSONATE_POOL
 from .logging import log, setup_logging
-from .models import ChatResult, ModelInfo, StreamChunk
+from .models import ChatResult, StreamChunk
 
 
 BASE = "https://duck.ai"
@@ -31,7 +31,7 @@ STATUS_URL = f"{BASE}/duckchat/v1/status"
 CHAT_URL = f"{BASE}/duckchat/v1/chat"
 MODELS_URL = f"{BASE}/duckchat/v1/models"
 
-FE_VERSION = "serp_20261117_201536_ET-1fa5b033293521d7ce8eee3f19c13def14a59cf5"
+FE_VERSION = "serp_20261118_135420_ET-1fa5b033293521d7ce8eee3f19c13def14a59cf5"
 
 
 class Client:
@@ -59,17 +59,19 @@ class Client:
         proxy: Optional[str] = None,
         model: Union[str, Model] = Model.GPT_6_LUNA,
         system: Optional[str] = None,
-        max_retries: int = 5,
+        max_retries: int = 4,
         log_level: str = "INFO",
         pool: Optional[Sequence[str]] = None,
         solved_hash: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> None:
         setup_logging(log_level)
+        # Pin android profile by default — don't rotate UA on challenge fails
+        pool = list(pool) if pool else ["chrome131_android", "chrome99_android"]
         self._http = HTTPClient(
-            impersonate=impersonate,
+            impersonate=impersonate or "chrome131_android",
             proxy=proxy,
-            pool=pool or IMPERSONATE_POOL,
+            pool=pool,
             user_agent=user_agent,
         )
         self._model = str(model)
@@ -168,7 +170,6 @@ class Client:
                         },
                     )
                     headers = dict(resp.headers)
-                    # Hash with the SAME UA the HTTP layer will send
                     solved, vqd4 = solve_from_status(
                         headers,
                         self._http.user_agent,
@@ -190,14 +191,15 @@ class Client:
                         len(self._hash1 or ""),
                     )
                     return
-                except (AuthError, ChallengeError, HTTPException, RateLimitError) as e:
+                except RateLimitError as e:
+                    log.warning("refresh rate limited attempt {}", attempt)
+                    await asyncio.sleep(1.5 * attempt)
+                except (AuthError, ChallengeError, HTTPException) as e:
                     log.warning("refresh attempt {} failed: {}", attempt, e)
-                    self._http.rotate()
-                    await asyncio.sleep(0.35 * attempt)
+                    await asyncio.sleep(0.4 * attempt)
                 except Exception as e:
                     log.warning("refresh unexpected: {}", e)
-                    self._http.rotate()
-                    await asyncio.sleep(0.45 * attempt)
+                    await asyncio.sleep(0.5 * attempt)
 
             if self._solved_hash:
                 self._hash1 = self._solved_hash
@@ -274,7 +276,6 @@ class Client:
             except AuthError as e:
                 last_err = e
                 log.warning("chat auth fail attempt {} — refreshing", attempt)
-                # Keep UA stable; only refresh challenge
                 self._hash1 = None
                 await self._refresh_tokens(force=True)
             except RateLimitError as e:
@@ -282,14 +283,14 @@ class Client:
                 log.warning("rate limited — reset guest session")
                 self.reset_session()
                 await self._refresh_tokens(force=True)
-                await asyncio.sleep(1.0 * attempt)
+                await asyncio.sleep(1.2 * attempt)
             except HTTPException as e:
                 last_err = e
                 log.warning("http error attempt {}: {}", attempt, e)
                 if getattr(e, "status", None) in (400, 418):
                     self._hash1 = None
                     await self._refresh_tokens(force=True)
-                await asyncio.sleep(0.35 * attempt)
+                await asyncio.sleep(0.4 * attempt)
 
         raise DuckAIException(f"chat failed after retries: {last_err}")
 
@@ -342,10 +343,10 @@ class Client:
                 log.warning("stream rate limited — reset")
                 self.reset_session()
                 await self._refresh_tokens(force=True)
-                await asyncio.sleep(1.0 * attempt)
+                await asyncio.sleep(1.2 * attempt)
             except Exception as e:
                 log.warning("stream error: {}", e)
-                await asyncio.sleep(0.35 * attempt)
+                await asyncio.sleep(0.4 * attempt)
 
         raise DuckAIException("stream failed after retries")
 

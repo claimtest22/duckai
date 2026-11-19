@@ -19,8 +19,6 @@ from base64 import b64decode, b64encode
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import orjson
-
 from .logging import log
 
 _SOLVER_JS = Path(__file__).resolve().parent / "solver.js"
@@ -34,6 +32,7 @@ def _sha256_b64(data: str) -> str:
 
 def _node_env() -> Dict[str, str]:
     env = dict(os.environ)
+    roots: List[str] = []
     try:
         root = subprocess.check_output(
             ["npm", "root", "-g"],
@@ -42,10 +41,21 @@ def _node_env() -> Dict[str, str]:
             stderr=subprocess.DEVNULL,
         ).strip()
         if root:
-            existing = env.get("NODE_PATH", "")
-            env["NODE_PATH"] = root if not existing else f"{root}{os.pathsep}{existing}"
+            roots.append(root)
     except Exception:
         pass
+    for guess in (
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+        str(Path.home() / ".npm-global" / "lib" / "node_modules"),
+    ):
+        if guess not in roots and Path(guess).is_dir():
+            roots.append(guess)
+    existing = env.get("NODE_PATH", "")
+    if existing:
+        roots.append(existing)
+    if roots:
+        env["NODE_PATH"] = os.pathsep.join(roots)
     return env
 
 
@@ -106,7 +116,7 @@ def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
             proc = subprocess.run(
                 ["node", str(_SOLVER_JS), tmp_path, user_agent],
                 capture_output=True,
-                timeout=12,
+                timeout=35,
                 check=False,
                 env=_node_env(),
             )
@@ -124,33 +134,25 @@ def solve_with_node(challenge_b64: str, user_agent: str) -> Optional[str]:
         raw = proc.stdout.decode("utf-8", "replace").strip()
         result = json.loads(raw)
         if result.get("__error"):
-            log.debug("node solver error: {}", result["__error"][:200])
-            return None
-        if not isinstance(result.get("client_hashes"), list):
-            log.debug("node solver bad shape")
+            log.debug("node solver error: {}", str(result["__error"])[:200])
             return None
 
-        hashed = [_sha256_b64(x) for x in result["client_hashes"]]
-        meta = dict(result.get("meta") or {})
-        meta.setdefault("origin", "https://duck.ai")
-        meta.setdefault("stack", "Error\n    at solve (native)")
-        meta.setdefault("duration", "15")
+        solved = result.get("solved")
+        if not solved:
+            log.debug("node solver missing solved")
+            return None
 
-        payload: Dict[str, Any] = {
-            "server_hashes": result.get("server_hashes") or [],
-            "client_hashes": hashed,
-            "signals": result.get("signals") or {},
-            "meta": meta,
-        }
-        solved = b64encode(orjson.dumps(payload)).decode("ascii")
         log.debug(
             "node pow ok  raw={}  servers={}  len={}",
-            result["client_hashes"][1:3] if len(result["client_hashes"]) > 1 else [],
-            len(payload["server_hashes"]),
+            (result.get("raw_client") or [])[1:3],
+            len(result.get("server_hashes") or []),
             len(solved),
         )
         return solved
     except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        log.debug("node solver timed out")
         return None
     except Exception as e:
         log.debug("node solver exception: {}", e)
@@ -186,7 +188,9 @@ def solve_static(
         "signals": {},
         "meta": meta,
     }
-    return b64encode(orjson.dumps(payload)).decode("ascii")
+    return b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
 
 
 def solve_from_status(

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * Duck.ai x-vqd-hash-1 solver using jsdom.
+ * Duck.ai x-vqd-hash-1 solver (jsdom).
  * Usage: node solver.js <challenge.js> <userAgent>
- * Prints JSON: {server_hashes, client_hashes (raw), signals, meta}
+ * Prints JSON: { solved, raw_client, server_hashes }
  */
 const fs = require('fs');
+const crypto = require('crypto');
 const { JSDOM } = require('jsdom');
 
 const src = fs.readFileSync(process.argv[2], 'utf8');
@@ -37,11 +38,11 @@ try {
 
 const proto = w.Element.prototype;
 for (const [prop, val] of [
-  ['offsetWidth', 17],
-  ['offsetHeight', 35],
-  ['scrollHeight', 19],
-  ['clientWidth', 17],
-  ['clientHeight', 35],
+  ['offsetWidth', 24],
+  ['offsetHeight', 24],
+  ['scrollHeight', 24],
+  ['clientWidth', 24],
+  ['clientHeight', 24],
 ]) {
   Object.defineProperty(proto, prop, {
     get() {
@@ -52,12 +53,12 @@ for (const [prop, val] of [
 }
 proto.getBoundingClientRect = function () {
   return {
-    width: 17,
-    height: 35,
+    width: 24,
+    height: 24,
     top: 0,
     left: 0,
-    right: 17,
-    bottom: 35,
+    right: 24,
+    bottom: 24,
     x: 0,
     y: 0,
   };
@@ -66,7 +67,39 @@ proto.getBoundingClientRect = function () {
 (async () => {
   try {
     const result = await w.eval(src);
-    process.stdout.write(JSON.stringify(result));
+    if (!result || !Array.isArray(result.client_hashes)) {
+      process.stdout.write(
+        JSON.stringify({ __error: 'bad challenge result', result })
+      );
+      process.exit(1);
+    }
+
+    const hashed = result.client_hashes.map((item) =>
+      crypto.createHash('sha256').update(String(item)).digest('base64')
+    );
+
+    const payload = {
+      server_hashes: result.server_hashes || [],
+      client_hashes: hashed,
+      signals: result.signals || {},
+      meta: {
+        ...(result.meta || {}),
+        origin: 'https://duck.ai',
+        stack: 'Error\n    at solve (native)',
+        duration: String((result.meta && result.meta.duration) || '15'),
+      },
+    };
+
+    // Match browser: btoa(JSON.stringify(...))
+    const solved = Buffer.from(JSON.stringify(payload)).toString('base64');
+
+    process.stdout.write(
+      JSON.stringify({
+        solved,
+        raw_client: result.client_hashes,
+        server_hashes: result.server_hashes || [],
+      })
+    );
   } catch (e) {
     process.stdout.write(
       JSON.stringify({ __error: String((e && e.stack) || e) })
