@@ -9,7 +9,7 @@ from .errors import *
 from .models import *
 from .enums import Model
 
-__version__ = "1.5.3"
+__version__ = "1.5.4"
 __author__ = "frat"
 
 __all__ = (
