@@ -16,6 +16,7 @@ from .challenge import solve_from_status
 from .enums import Model
 from .errors import (
     AuthError,
+    BanLimitError,
     ChallengeError,
     DuckAIException,
     HTTPException,
@@ -55,7 +56,7 @@ class Client:
     def __init__(
         self,
         *,
-        impersonate: Optional[str] = "chrome131_android",
+        impersonate: Optional[str] = "chrome131",
         proxy: Optional[str] = None,
         model: Union[str, Model] = Model.GPT_6_LUNA,
         system: Optional[str] = None,
@@ -66,9 +67,9 @@ class Client:
         user_agent: Optional[str] = None,
     ) -> None:
         setup_logging(log_level)
-        pool = list(pool) if pool else ["chrome131_android", "chrome99_android"]
+        pool = list(pool) if pool else ["chrome131", "chrome124", "chrome131_android"]
         self._http = HTTPClient(
-            impersonate=impersonate or "chrome131_android",
+            impersonate=impersonate or "chrome131",
             proxy=proxy,
             pool=pool,
             user_agent=user_agent,
@@ -145,6 +146,12 @@ class Client:
         }
         return b64encode(orjson.dumps(payload)).decode("ascii")
 
+    async def _warmup(self) -> None:
+        try:
+            await self._http.get(BASE + "/")
+        except Exception as exc:
+            log.debug("warmup failed: {}", exc)
+
     async def _refresh_tokens(self, force: bool = False) -> None:
         if self._solved_hash and not force:
             self._hash1 = self._solved_hash
@@ -159,6 +166,7 @@ class Client:
             if not force and self._hash1 and (now - self._last_refresh) < 600:
                 return
 
+            await self._warmup()
             for attempt in range(1, self._max_retries + 1):
                 try:
                     resp = await self._http.get(
@@ -272,6 +280,10 @@ class Client:
                         {"role": "assistant", "content": self._content_blocks(text)}
                     )
                 return ChatResult(content=text, model=model_s, vqd=self._vqd4)
+            except BanLimitError as e:
+                last_err = e
+                log.warning("BN_LIMIT attempt {} — backing off", attempt)
+                await asyncio.sleep(8.0 * attempt)
             except AuthError as e:
                 last_err = e
                 log.warning("chat auth fail attempt {} — refreshing", attempt)
