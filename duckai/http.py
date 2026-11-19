@@ -15,14 +15,17 @@ from .logging import log
 from .errors import HTTPException, RateLimitError, AuthError, BanLimitError
 
 
+# Prefer Android Chrome profiles — matches real phone traffic
 IMPERSONATE_POOL: List[str] = [
+    "chrome131_android",
     "chrome131",
     "chrome124",
     "chrome120",
-    "chrome131_android",
     "chrome99_android",
 ]
 
+# Canonical UA strings that curl_cffi emits for each profile.
+# MUST stay in sync with what the wire request sends or PoW fails.
 UA_FOR_IMPERSONATE: Dict[str, str] = {
     "chrome131_android": (
         "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
@@ -48,6 +51,21 @@ UA_FOR_IMPERSONATE: Dict[str, str] = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "chrome116": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0.0.0 Safari/537.36"
+    ),
+    "chrome110": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/110.0.0.0 Safari/537.36"
+    ),
+    "chrome99": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/99.0.4844.51 Safari/537.36"
     ),
 }
 
@@ -90,7 +108,7 @@ class HTTPClient:
         user_agent: Optional[str] = None,
     ) -> None:
         self._pool = list(pool or IMPERSONATE_POOL)
-        self._impersonate = impersonate or "chrome131"
+        self._impersonate = impersonate or "chrome131_android"
         if self._impersonate not in self._pool:
             self._pool.insert(0, self._impersonate)
         self._proxy = proxy
@@ -98,7 +116,7 @@ class HTTPClient:
         self._fixed_ua = user_agent
         self._ua = user_agent or UA_FOR_IMPERSONATE.get(
             self._impersonate,
-            UA_FOR_IMPERSONATE["chrome131"],
+            UA_FOR_IMPERSONATE["chrome131_android"],
         )
         self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
         mobile = "android" in self._impersonate
@@ -144,7 +162,7 @@ class HTTPClient:
             self._impersonate = random.choice(candidates)
             self._ua = UA_FOR_IMPERSONATE.get(
                 self._impersonate,
-                UA_FOR_IMPERSONATE["chrome131"],
+                UA_FOR_IMPERSONATE["chrome131_android"],
             )
             self._sec_ch_ua = _sec_ch_ua_for(self._impersonate)
             mobile = "android" in self._impersonate
