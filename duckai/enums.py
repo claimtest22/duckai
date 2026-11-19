@@ -8,6 +8,7 @@ from enum import Enum
 class Model(str, Enum):
     """Available Duck.ai models (free tier + common ones)."""
 
+    GPT_6_LUNA = "gpt-5.6-luna"
     GPT_5_6_LUNA = "gpt-5.6-luna"
     GPT_5_4_MINI = "gpt-5.4-mini"
     CLAUDE_HAIKU_4_5 = "claude-haiku-4-5"
