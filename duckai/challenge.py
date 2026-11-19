@@ -7,7 +7,6 @@ and returns the base64 payload for the x-vqd-hash-1 header.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import subprocess
@@ -23,13 +22,39 @@ _SOLVER_JS = Path(__file__).resolve().parent / 'solver.js'
 _NODE = shutil.which('node') or shutil.which('nodejs')
 
 
-def _solve_sync(challenge_b64: str, user_agent: str) -> str:
+def solve_static(
+    challenge_b64: str,
+    user_agent: str,
+    *,
+    origin: str = 'https://duck.ai',
+    sec_ch_ua: Optional[str] = None,
+) -> str:
+    """Solve the x-vqd-hash-1 challenge via Node vm.
+
+    Parameters
+    ----------
+    challenge_b64:
+        Raw base64 challenge from the status response header.
+    user_agent:
+        User-Agent string that will be sent on the subsequent chat request.
+    origin:
+        Origin embedded in the solved meta payload.
+    sec_ch_ua:
+        Optional sec-ch-ua brands string (unused by node solver, kept for API compat).
+    """
     if not _NODE:
-        raise RuntimeError('node binary not found \u2014 install node to solve duck.ai challenges')
+        raise RuntimeError('node binary not found — install node to solve duck.ai challenges')
     if not _SOLVER_JS.is_file():
         raise RuntimeError(f'solver.js missing at {_SOLVER_JS}')
 
-    payload = orjson.dumps({'challenge': challenge_b64, 'user_agent': user_agent})
+    payload = orjson.dumps(
+        {
+            'challenge': challenge_b64,
+            'user_agent': user_agent,
+            'origin': origin,
+            'sec_ch_ua': sec_ch_ua or '',
+        }
+    )
     env = dict(os.environ)
     proc = subprocess.run(
         [_NODE, str(_SOLVER_JS)],
@@ -51,33 +76,34 @@ def _solve_sync(challenge_b64: str, user_agent: str) -> str:
     if not data.get('ok') or not data.get('hash'):
         raise RuntimeError(f'node solver error: {data.get("error") or err or "unknown"}')
 
-    return str(data['hash'])
-
-
-async def solve_static(
-    challenge_b64: str,
-    user_agent: str,
-    *,
-    origin: str = 'https://duck.ai',
-) -> str:
-    """Solve the x-vqd-hash-1 challenge via Node vm."""
-    loop = asyncio.get_running_loop()
-    solved = await loop.run_in_executor(None, _solve_sync, challenge_b64, user_agent)
+    solved = str(data['hash'])
     log.debug('challenge solved len={} origin={}', len(solved), origin)
     return solved
 
 
-async def solve_from_status(
+def solve_from_status(
     headers: Dict[str, str],
     user_agent: str,
     *,
     origin: str = 'https://duck.ai',
+    sec_ch_ua: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Extract challenge + vqd-4 from status headers and solve."""
+    """Extract challenge + vqd-4 from status headers and solve.
+
+    Returns
+    -------
+    tuple
+        ``(solved_hash_1, vqd_4)``
+    """
     h = {k.lower(): v for k, v in headers.items()}
     challenge = h.get('x-vqd-hash-1')
     vqd4 = h.get('x-vqd-4')
     if not challenge:
         return None, vqd4
-    solved = await solve_static(challenge, user_agent, origin=origin)
+    solved = solve_static(
+        challenge,
+        user_agent,
+        origin=origin,
+        sec_ch_ua=sec_ch_ua,
+    )
     return solved, vqd4
