@@ -41,8 +41,24 @@ def _b64url_int(n: int) -> str:
     return urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode("ascii")
 
 
-def make_durable_stream() -> Dict[str, Any]:
-    """RSA-OAEP-256 public JWK envelope the frontend always sends."""
+def make_durable_stream(conversation_id: str) -> Dict[str, Any]:
+    """
+    Exact shape the live frontend sends (Nov 2026 capture):
+
+    {
+      "messageId": "<uuid>",
+      "conversationId": "<uuid>",
+      "publicKey": {
+        "alg": "RSA-OAEP-256",
+        "e": "AQAB",
+        "ext": true,
+        "key_ops": ["encrypt"],
+        "kty": "RSA",
+        "n": "<base64url modulus>",
+        "use": "enc"
+      }
+    }
+    """
     try:
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.hazmat.backends import default_backend
@@ -51,33 +67,36 @@ def make_durable_stream() -> Dict[str, Any]:
             public_exponent=65537, key_size=2048, backend=default_backend()
         )
         nums = priv.public_key().public_numbers()
-        jwk = {
-            "kty": "RSA",
+        public_key = {
             "alg": "RSA-OAEP-256",
             "e": _b64url_int(nums.e),
+            "ext": True,
+            "key_ops": ["encrypt"],
+            "kty": "RSA",
             "n": _b64url_int(nums.n),
             "use": "enc",
-            "ext": True,
-            "key_ops": ["encrypt"],
         }
     except Exception:
-        # Static fallback JWK (same shape the FE uses when subtle is unavailable)
-        jwk = {
-            "kty": "RSA",
+        public_key = {
             "alg": "RSA-OAEP-256",
             "e": "AQAB",
-            "n": (
-                "sXinxGRxiKAwvP8f5kT0nq0vL1Z8y9c0hQ3p2mN4oP5qR6sT7uV8wX9yZ0aB1cD2eF3gH4iJ5kL"
-                "6mN7oP8qR9sT0uV1wX2yZ3aB4cD5eF6gH7iJ8kL9mN0oP1qR2sT3uV4wX5yZ6aB7cD8eF9gH0iJ"
-                "1kL2mN3oP4qR5sT6uV7wX8yZ9aB0cD1eF2gH3iJ4kL5mN6oP7qR8sT9uV0wX1yZ2aB3cD4eF5gH"
-            ),
-            "use": "enc",
             "ext": True,
             "key_ops": ["encrypt"],
+            "kty": "RSA",
+            "n": (
+                "oOF1zWL1dy752wuJMUveQ74NE_AmTYteY87GOTsx80VntjZkDz3bOQ1-5WsF-zU0jA9Lh_"
+                "rdSDEBwhbe5VjsgHhqODAmJIG3rjg5IILAwbXRLxpxUwmioSq7TFank8NnLQkcJCGQiQEqo"
+                "bQ39opqSDUQjjf_aXo2GobviOU2MPwbsUqji3qd_iwvOlbentk7LsYwJxsgCOQjuAjkFVnW"
+                "EUr1tHBafVWfC0qOiMJn_gF6m6POs3SVb_BMvbtfGUXZseOPVLBJtQ0DIyUGoQvhy2VjfOF"
+                "nwnhNGbKR4UJRXHi_tXWbi0bviqi42H-VKRmrVV6ToyUQtqn0FvKmgUGQoQ"
+            ),
+            "use": "enc",
         }
+
     return {
         "messageId": str(uuid.uuid4()),
-        "publicKeyJwk": jwk,
+        "conversationId": conversation_id,
+        "publicKey": public_key,
     }
 
 
@@ -115,7 +134,6 @@ class Client:
         user_agent: Optional[str] = None,
     ) -> None:
         setup_logging(log_level)
-        # Prefer Android profiles first — matches real phone traffic & reduces BN_LIMIT
         pool = list(pool) if pool else [
             "chrome131_android",
             "chrome131",
@@ -194,25 +212,27 @@ class Client:
     def _fe_signals(self) -> str:
         now = int(time.time() * 1000)
         payload = {
-            "start": now - 2500,
+            "start": now - 1500,
             "events": [
-                {"name": "onboarding_impression", "delta": 220},
-                {"name": "onboarding_finish", "delta": 1800},
-                {"name": "startNewChat_free", "delta": 2100},
-                {"name": "action", "delta": 2300, "trusted": True},
+                {"name": "startNewChat_free", "delta": 261},
+                {"name": "action", "delta": 1458, "trusted": True},
             ],
-            "end": 2400,
+            "end": 4050,
         }
         return b64encode(orjson.dumps(payload)).decode("ascii")
 
     async def _warmup(self) -> None:
-        """Mirror real browser boot: home + capabilities + auth/token + country."""
         if self._warmed and self._fe_version:
             return
         try:
             home = await self._http.get(BASE + "/")
-            text = home.text if hasattr(home, "text") else home.content.decode("utf-8", "replace")
+            text = (
+                home.text
+                if hasattr(home, "text")
+                else home.content.decode("utf-8", "replace")
+            )
             import re
+
             tag = re.search(r'data-version-tag="([^"]+)"', text)
             sha = re.search(r'data-version-sha="([^"]+)"', text)
             if tag and sha:
@@ -269,15 +289,15 @@ class Client:
                     log.info(
                         "tokens refreshed  imp={}  ua={}...  vqd4={}  hash_len={}",
                         self._http.impersonate,
-                        self._http.user_agent[:40],
+                        self._http.user_agent[:50],
                         bool(self._vqd4),
                         len(self._hash1 or ""),
                     )
                     return
-                except BanLimitError as e:
+                except BanLimitError:
                     log.warning("refresh BN_LIMIT attempt {}", attempt)
                     await asyncio.sleep(3.0 * attempt)
-                except RateLimitError as e:
+                except RateLimitError:
                     log.warning("refresh rate limited attempt {}", attempt)
                     await asyncio.sleep(1.5 * attempt)
                 except (AuthError, ChallengeError, HTTPException) as e:
@@ -315,26 +335,16 @@ class Client:
         messages: List[Dict[str, Any]],
         model: str,
     ) -> Dict[str, Any]:
-        # Matches current duck.ai frontend shape (metadata + durableStream required)
+        # Exact shape from live Moto G / Chrome 157 capture (Nov 19 2026)
         return {
             "model": model,
-            "metadata": {
-                "toolChoice": {
-                    "GenerateImage": False,
-                    "WebSearch": False,
-                    "NewsSearch": False,
-                    "VideosSearch": False,
-                    "LocalSearch": False,
-                    "WeatherForecast": False,
-                },
-            },
             "messages": messages,
             "canUseTools": True,
             "reasoningEffort": "none",
             "canUseApproxLocation": None,
             "canDelegateImageGeneration": None,
-            "canShowGreeting": False,
-            "durableStream": make_durable_stream(),
+            "canShowGreeting": True,
+            "durableStream": make_durable_stream(self._conversation_id),
         }
 
     async def _ensure_ready(self) -> None:
@@ -379,13 +389,12 @@ class Client:
             except BanLimitError as e:
                 last_err = e
                 log.warning(
-                    "BN_LIMIT attempt {} — IP/entrypoint blocked (not challenge). "
-                    "Real browser works on residential IPs; curl from banned/datacenter IPs gets this.",
+                    "BN_LIMIT attempt {} — body/headers still mismatched or IP flagged",
                     attempt,
                 )
                 if attempt >= 2:
                     break
-                await asyncio.sleep(5.0 * attempt)
+                await asyncio.sleep(4.0 * attempt)
             except AuthError as e:
                 last_err = e
                 log.warning("chat auth fail attempt {} — refreshing", attempt)
@@ -448,11 +457,11 @@ class Client:
                         }
                     )
                 return
-            except BanLimitError as e:
+            except BanLimitError:
                 log.warning("stream BN_LIMIT attempt {}", attempt)
                 if attempt >= 2:
                     break
-                await asyncio.sleep(5.0 * attempt)
+                await asyncio.sleep(4.0 * attempt)
             except AuthError:
                 log.warning("stream auth fail — refresh")
                 self._hash1 = None
