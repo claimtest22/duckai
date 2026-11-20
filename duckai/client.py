@@ -8,6 +8,7 @@ import asyncio
 import time
 import uuid
 from base64 import b64encode, urlsafe_b64encode
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Union
 
 import orjson
@@ -42,23 +43,7 @@ def _b64url_int(n: int) -> str:
 
 
 def make_durable_stream(conversation_id: str) -> Dict[str, Any]:
-    """
-    Exact shape the live frontend sends (Nov 2026 capture):
-
-    {
-      "messageId": "<uuid>",
-      "conversationId": "<uuid>",
-      "publicKey": {
-        "alg": "RSA-OAEP-256",
-        "e": "AQAB",
-        "ext": true,
-        "key_ops": ["encrypt"],
-        "kty": "RSA",
-        "n": "<base64url modulus>",
-        "use": "enc"
-      }
-    }
-    """
+    """Exact live frontend durableStream shape (Nov 2026 capture)."""
     try:
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.hazmat.backends import default_backend
@@ -101,7 +86,16 @@ def make_durable_stream(conversation_id: str) -> Dict[str, Any]:
 
 
 class Client:
-    """Async client for Duck.ai."""
+    """Async client for Duck.ai.
+
+    History model
+    -------------
+    - ``transcript``  permanent local log of every turn (user-visible, not fed to the model,
+      and not clearable via the public API).
+    - ``history``     optional context that *is* sent to the model when ``history=True``.
+    - Each ``chat(..., new_chat=True)`` (default) starts a fresh conversation_id so the
+      backend treats it as a new thread.
+    """
 
     __slots__ = (
         "_http",
@@ -111,6 +105,7 @@ class Client:
         "_hash1",
         "_max_retries",
         "_history",
+        "_transcript",
         "_lock",
         "_last_refresh",
         "_solved_hash",
@@ -118,6 +113,7 @@ class Client:
         "_journey_id",
         "_fe_version",
         "_warmed",
+        "_store_path",
     )
 
     def __init__(
@@ -132,6 +128,7 @@ class Client:
         pool: Optional[Sequence[str]] = None,
         solved_hash: Optional[str] = None,
         user_agent: Optional[str] = None,
+        store_path: Optional[Union[str, Path]] = None,
     ) -> None:
         setup_logging(log_level)
         pool = list(pool) if pool else [
@@ -153,12 +150,16 @@ class Client:
         self._solved_hash = solved_hash
         self._max_retries = max_retries
         self._history: List[Dict[str, Any]] = []
+        self._transcript: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self._last_refresh = 0.0
         self._conversation_id = str(uuid.uuid4())
         self._journey_id = uuid.uuid4().hex
         self._fe_version: Optional[str] = None
         self._warmed = False
+        self._store_path: Optional[Path] = Path(store_path) if store_path else None
+        if self._store_path:
+            self._load_transcript()
 
     @property
     def model(self) -> str:
@@ -170,19 +171,67 @@ class Client:
 
     @property
     def history(self) -> List[Dict[str, Any]]:
+        """Model context (what would be sent when history=True)."""
         return list(self._history)
 
+    @property
+    def transcript(self) -> List[Dict[str, Any]]:
+        """Permanent local log of every turn. Not sent to the model. Not clearable."""
+        return list(self._transcript)
+
+    @property
+    def conversation_id(self) -> str:
+        return self._conversation_id
+
     def clear_history(self) -> None:
+        """Clear *model* context only. Transcript is never cleared."""
         self._history.clear()
+
+    def new_conversation(self) -> str:
+        """Start a brand-new backend conversation. Returns the new conversation_id."""
         self._conversation_id = str(uuid.uuid4())
+        self._journey_id = uuid.uuid4().hex
+        self._history.clear()
+        return self._conversation_id
 
     def reset_session(self) -> None:
+        """Drop tokens / warmup state and open a new conversation. Transcript stays."""
         self._hash1 = self._solved_hash
         self._vqd4 = None
         self._last_refresh = 0.0
         self._warmed = False
-        self.clear_history()
-        self._journey_id = uuid.uuid4().hex
+        self.new_conversation()
+
+    def _load_transcript(self) -> None:
+        if not self._store_path or not self._store_path.exists():
+            return
+        try:
+            data = orjson.loads(self._store_path.read_bytes())
+            if isinstance(data, list):
+                self._transcript = data
+                log.debug("loaded {} transcript turns from {}", len(data), self._store_path)
+        except Exception as exc:
+            log.warning("transcript load failed: {}", exc)
+
+    def _save_transcript(self) -> None:
+        if not self._store_path:
+            return
+        try:
+            self._store_path.parent.mkdir(parents=True, exist_ok=True)
+            self._store_path.write_bytes(orjson.dumps(self._transcript, option=orjson.OPT_INDENT_2))
+        except Exception as exc:
+            log.warning("transcript save failed: {}", exc)
+
+    def _append_transcript(self, role: str, text: str, *, conversation_id: str) -> None:
+        self._transcript.append(
+            {
+                "role": role,
+                "content": text,
+                "conversation_id": conversation_id,
+                "ts": int(time.time()),
+            }
+        )
+        self._save_transcript()
 
     @staticmethod
     def _content_blocks(text: str) -> List[Dict[str, str]]:
@@ -192,11 +241,11 @@ class Client:
         self,
         content: str,
         *,
-        history: bool,
+        feed_history: bool,
         system: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
-        if history:
+        if feed_history:
             messages.extend(self._history)
 
         sys_prompt = system if system is not None else self._system
@@ -335,7 +384,6 @@ class Client:
         messages: List[Dict[str, Any]],
         model: str,
     ) -> Dict[str, Any]:
-        # Exact shape from live Moto G / Chrome 157 capture (Nov 19 2026)
         return {
             "model": model,
             "messages": messages,
@@ -358,12 +406,24 @@ class Client:
         *,
         model: Optional[Union[str, Model]] = None,
         system: Optional[str] = None,
-        history: bool = True,
+        history: bool = False,
+        new_chat: bool = True,
     ) -> ChatResult:
+        """
+        Send a message.
+
+        history=False (default)  -> do not feed prior turns to the model
+        new_chat=True  (default) -> mint a fresh conversation_id for this request
+        Transcript always records both sides locally regardless of history/new_chat.
+        """
+        if new_chat:
+            self.new_conversation()
+
         await self._ensure_ready()
         model_s = str(model or self._model)
-        messages = self._build_messages(content, history=history, system=system)
+        messages = self._build_messages(content, feed_history=history, system=system)
         body = self._chat_body(messages, model_s)
+        convo = self._conversation_id
 
         last_err: Optional[Exception] = None
         for attempt in range(1, self._max_retries + 1):
@@ -378,6 +438,10 @@ class Client:
                     self._vqd4 = new_vqd
 
                 text = self._parse_sse(resp.content)
+
+                self._append_transcript("user", content, conversation_id=convo)
+                self._append_transcript("assistant", text, conversation_id=convo)
+
                 if history:
                     self._history.append(
                         {"role": "user", "content": self._content_blocks(content)}
@@ -385,11 +449,12 @@ class Client:
                     self._history.append(
                         {"role": "assistant", "content": self._content_blocks(text)}
                     )
+
                 return ChatResult(content=text, model=model_s, vqd=self._vqd4)
             except BanLimitError as e:
                 last_err = e
                 log.warning(
-                    "BN_LIMIT attempt {} — body/headers still mismatched or IP flagged",
+                    "BN_LIMIT attempt {} — body/headers mismatch or IP flagged",
                     attempt,
                 )
                 if attempt >= 2:
@@ -422,12 +487,17 @@ class Client:
         *,
         model: Optional[Union[str, Model]] = None,
         system: Optional[str] = None,
-        history: bool = True,
+        history: bool = False,
+        new_chat: bool = True,
     ) -> AsyncIterator[StreamChunk]:
+        if new_chat:
+            self.new_conversation()
+
         await self._ensure_ready()
         model_s = str(model or self._model)
-        messages = self._build_messages(content, history=history, system=system)
+        messages = self._build_messages(content, feed_history=history, system=system)
         body = self._chat_body(messages, model_s)
+        convo = self._conversation_id
 
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -446,6 +516,10 @@ class Client:
                         full.append(chunk.content)
                     yield chunk
 
+                joined = "".join(full)
+                self._append_transcript("user", content, conversation_id=convo)
+                self._append_transcript("assistant", joined, conversation_id=convo)
+
                 if history and full:
                     self._history.append(
                         {"role": "user", "content": self._content_blocks(content)}
@@ -453,7 +527,7 @@ class Client:
                     self._history.append(
                         {
                             "role": "assistant",
-                            "content": self._content_blocks("".join(full)),
+                            "content": self._content_blocks(joined),
                         }
                     )
                 return
